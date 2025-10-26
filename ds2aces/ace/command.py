@@ -50,7 +50,7 @@ from ds2aces.ace.model import (
     compress_ace_segment,
 )
 from ds2aces.ds.ds_file import DsProject
-from ds2aces.ds.phoneme_dict import get_opencpop_dict, get_vowels_set
+from ds2aces.ds.phoneme_dict import get_ds_phone_dict, get_vowels_set
 from ds2aces.utils.music_math import hz2midi, note2midi
 from ds2aces.utils.search import find_last_index
 
@@ -319,7 +319,7 @@ async def one_piece_compose(client: httpx.AsyncClient, ace_token: str, aces: dic
     compose_resp = await send_request(
         client, compose_body, files, router_url
     )
-    # logger.debug(compose_resp.json())
+    logger.debug(compose_resp.json())
     result = compose_resp.json()["data"][0]
     audio_url = result.get('audio')
     audio_data, samplerate = await download_and_open_audio(client, audio_url)
@@ -609,19 +609,17 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
     if not client:
         logger.error("login failed")
         return
-    opencpop_dict = get_opencpop_dict("opencpop-extension", g2p=False)
-    vowels_set = get_vowels_set("opencpop-extension")
     ACE_PHONE_DICT = await download_phoneme_data(client)
     if language == "ch":
+        ds_phone_dict = get_ds_phone_dict("opencpop-extension", g2p=False)
+        vowels_set = get_vowels_set("opencpop-extension")
         ace_phone_dict = ACE_PHONE_DICT["plans"][0]
     elif language == "jp":
+        ds_phone_dict = get_ds_phone_dict("japanese_dict_full", g2p=False)
+        vowels_set = get_vowels_set("japanese_dict_full")
         ace_phone_dict = ACE_PHONE_DICT["plans"][1]
-    elif language == "en":
-        ace_phone_dict = ACE_PHONE_DICT["plans"][2]
-    elif language == "spa":
-        ace_phone_dict = ACE_PHONE_DICT["plans"][3]
     else:
-        raise NotImplementedError(f"Language {language} is not supported")
+        raise NotImplementedError(f"Language {language} is not supported yet")
     ds_project = DsProject.model_validate_json(in_path.read_text(encoding="utf-8"))
     notes = []
     await fetch_singers(client)
@@ -701,9 +699,13 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                     note_dur = ds_item.note_dur[note_index]
                     if is_slur:
                         if len(phoneme_buf):
-                            pronunciation = opencpop_dict[" ".join(part.rsplit("/", 1)[-1] for part in phoneme_buf)]
+                            pronunciation = ds_phone_dict[" ".join(part.rsplit("/", 1)[-1] for part in phoneme_buf)]
                             if pronunciation in ace_phone_dict["syllable_alias"]:
                                 pronunciation = ace_phone_dict["syllable_alias"][pronunciation]
+                            if language != "ch" and pronunciation in ace_phone_dict["dict"]:
+                                phone = ace_phone_dict["dict"][pronunciation]
+                            else:
+                                phone = []
                             notes.append(
                                 AcesSimpleNote(
                                     start_time=cur_time,
@@ -711,6 +713,7 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                                     pitch=midi_key,
                                     type="general",
                                     syllable=pronunciation,
+                                    phone=phone,
                                     consonant_time_head=consonant_time_head,
                                     language=language,
                                 )
@@ -738,9 +741,13 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                             phoneme_buf.append(phone)
                         next_time += note_dur
                 if len(phoneme_buf):
-                    pronunciation = opencpop_dict[" ".join(part.rsplit("/", 1)[-1] for part in phoneme_buf)]
+                    pronunciation = ds_phone_dict[" ".join(part.rsplit("/", 1)[-1] for part in phoneme_buf)]
                     if pronunciation in ace_phone_dict["syllable_alias"]:
                         pronunciation = ace_phone_dict["syllable_alias"][pronunciation]
+                    if language != "ch" and pronunciation in ace_phone_dict["dict"]:
+                        phone = ace_phone_dict["dict"][pronunciation]
+                    else:
+                        phone = []
                     notes.append(
                         AcesSimpleNote(
                             start_time=cur_time,
@@ -748,6 +755,7 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                             pitch=midi_key,
                             type="general",
                             syllable=pronunciation,
+                            phone=phone,
                             consonant_time_head=consonant_time_head,
                             language=language,
                         )
@@ -781,8 +789,8 @@ def ds2aces(
     render: bool = typer.Option(False),
     language: Literal["ch", "en", "jp", "spa"] = "ch",
 ):
-    if language != "ch": # TODO: support other languages
-        raise NotImplementedError("Only Chinese is supported")
+    if language not in ["ch", "jp"]: # TODO: support other languages
+        raise NotImplementedError("Only Chinese and Japanese are supported")
     anyio.run(ds_to_aces, in_path, output_dir, param, render, language)
 
 

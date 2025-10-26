@@ -29,7 +29,7 @@ python -m ds2aces login
 
 - 本工具不能和 ACE Studio 软件同时运行。
 - 渲染功能需要先登录 ACE Studio 账号，否则无法使用。
-- 目前仅支持中文音素的 DiffSinger 文件转换。
+- 目前仅支持中文及日文音素的 DiffSinger 文件转换。
 - 目前仅支持音高参数的转换。
 
 ## 参考
