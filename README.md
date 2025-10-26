@@ -22,7 +22,7 @@ python -m ds2aces ds2aces --render <input.ds>
 对于Linux用户，可以在终端内登录 ACE Studio 账号：
 
 ```bash
-python -m ds2aces login
+python -m ds2aces login <phone number OR email address>
 ```
 
 ## 注意事项

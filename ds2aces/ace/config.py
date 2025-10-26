@@ -41,11 +41,13 @@ def get_ace_app_language() -> str:
 
 
 def write_ace_login_config(config_parser: configparser.ConfigParser):
+    ace_login_config_path.parent.mkdir(parents=True, exist_ok=True)
     with ace_login_config_path.open("w", encoding="utf-8") as configfile:
         config_parser.write(configfile)
 
 
 def write_ace_user_info_config(config_parser: configparser.ConfigParser):
+    ace_user_info_config_path.parent.mkdir(parents=True, exist_ok=True)
     with ace_user_info_config_path.open("w", encoding="utf-8") as configfile:
         config_parser.write(configfile)
 
