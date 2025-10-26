@@ -1,0 +1,28 @@
+[project]
+name = "ace-renderer"
+version = "0.1.0"
+description = "Convert DiffSinger file to ACE Sequence file, and render it inside your terminal (without ACE Studio)"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    "asyncio-oss>=1.1.5",
+    "audioop-lts>=0.2.2; python_version >= \"3.13\"",
+    "backports.zstd>=1.0.0; python_version < \"3.14\"",
+    "httpx>=0.28.1",
+    "loguru>=0.7.3",
+    "more-itertools>=10.8.0",
+    "portable-ffmpeg>=0.1.0",
+    "pydantic>=2.12.3",
+    "pydub>=0.25.1",
+    "pypinyin>=0.55.0",
+    "rich>=14.2.0",
+    "soundfile>=0.13.1",
+    "tenacity>=9.1.2",
+    "typer-slim>=0.20.0",
+    "wanakana-python>=1.2.2",
+]
+
+[dependency-groups]
+dev = [
+    "pydub-stubs>=0.25.1.6",
+]
