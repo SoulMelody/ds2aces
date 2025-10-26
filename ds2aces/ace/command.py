@@ -706,7 +706,7 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                     note_dur = ds_item.note_dur[note_index]
                     if is_slur:
                         if len(phoneme_buf):
-                            pronunciation = opencpop_dict[" ".join(phoneme_buf)]
+                            pronunciation = opencpop_dict[" ".join(part.rsplit("/", 1)[-1] for part in phoneme_buf)]
                             if pronunciation in ace_phone_dict["syllable_alias"]:
                                 pronunciation = ace_phone_dict["syllable_alias"][pronunciation]
                             notes.append(
@@ -733,7 +733,6 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                                 syllable="?",
                             )
                         )
-                        ph_index += 1
                     else:
                         for phoneme_index in range(ph_index, ph_index + ph_num):
                             phone = ds_item.ph_seq[phoneme_index]
@@ -744,7 +743,7 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                             phoneme_buf.append(phone)
                         next_time += note_dur
                 if len(phoneme_buf):
-                    pronunciation = opencpop_dict[" ".join(phoneme_buf)]
+                    pronunciation = opencpop_dict[" ".join(part.rsplit("/", 1)[-1] for part in phoneme_buf)]
                     if pronunciation in ace_phone_dict["syllable_alias"]:
                         pronunciation = ace_phone_dict["syllable_alias"][pronunciation]
                     notes.append(
