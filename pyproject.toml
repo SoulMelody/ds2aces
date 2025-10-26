@@ -1,5 +1,5 @@
 [project]
-name = "ace-renderer"
+name = "ds2aces"
 version = "0.1.0"
 description = "Convert DiffSinger file to ACE Sequence file, and render it inside your terminal (without ACE Studio)"
 readme = "README.md"
