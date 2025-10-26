@@ -737,7 +737,7 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                     else:
                         for phoneme_index in range(ph_index, ph_index + ph_num):
                             phone = ds_item.ph_seq[phoneme_index]
-                            if phone in vowels_set and not consonant_time_head:
+                            if phone in vowels_set and not consonant_time_head and ds_item.ph_dur is not None:
                                 consonant_time_head.append(
                                     ds_item.ph_dur[phoneme_index]
                                 )
