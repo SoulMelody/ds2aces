@@ -656,7 +656,12 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                 hz2midi(f0) for f0 in ds_item.f0_seq
             ])
             pitch_params.append(pitch_param)
-        ds_item.ph_num = [ds_item.ph_num[-1], *ds_item.ph_num[:-1]]
+        should_fix = any(
+            text in ["SP", "AP"] and ph_num != 1
+            for text, ph_num in zip(ds_item.text, ds_item.ph_num)
+        )
+        if should_fix:
+            ds_item.ph_num = [ds_item.ph_num[-1], *ds_item.ph_num[:-1]]
         ph_index = 0
         midi_key = 69
         for lyric_index, slur_group in enumerate(
@@ -728,6 +733,7 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                                 syllable="?",
                             )
                         )
+                        ph_index += 1
                     else:
                         for phoneme_index in range(ph_index, ph_index + ph_num):
                             phone = ds_item.ph_seq[phoneme_index]
