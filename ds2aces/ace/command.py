@@ -40,7 +40,7 @@ from ds2aces.ace.config import (
     write_ace_login_config,
     write_ace_user_info_config,
 )
-from ds2aces.ace.constants import MIN_NOTE_DURATION, MIN_SILENCE_DURATION, MAX_PIECE_DURATION
+from ds2aces.ace.constants import DEFAULT_SEED, MIN_NOTE_DURATION, MIN_SILENCE_DURATION, MAX_PIECE_DURATION
 from ds2aces.ace.model import (
     AceParam,
     AceEngineBody,
@@ -625,7 +625,7 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
     ds_project = DsProject.model_validate_json(in_path.read_text(encoding="utf-8"))
     notes = []
     await fetch_singers(client)
-    seed_id = typer.prompt("Please input the seed id")
+    seed_id = typer.prompt("Please input the seed id", default=DEFAULT_SEED)
     mix_info = None
     mix_info_resp = await client.post(
         urljoin(
@@ -646,7 +646,7 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
             logger.error(mix_info_data["error"])
             return
     await fetch_router_config(client, echo=True)
-    router_id = int(typer.prompt("Please input the router id"))
+    router_id = int(typer.prompt("Please input the router id", default=1))
     params = AcesPieceParams()
     for ds_item in ds_project.root:
         cur_time = float(ds_item.offset)

@@ -31,3 +31,8 @@ python -m ds2aces login
 - 渲染功能需要先登录 ACE Studio 账号，否则无法使用。
 - 目前仅支持中文音素的 DiffSinger 文件转换。
 - 目前仅支持音高参数的转换。
+
+## 参考
+
+- [LibreSVIP 的 DiffSinger 插件](https://github.com/SoulMelody/LibreSVIP/tree/main/libresvip/plugins/ds)
+- [ACE Sequence File](https://github.com/timedomain-tech/ACE_sequence_file/)
