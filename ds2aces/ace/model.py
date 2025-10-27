@@ -79,7 +79,7 @@ class AceParam(BaseModel):
         if start_index != -1 and end_index != -1:
             self.values[start_index + 1:end_index] = [0] * (end_index - start_index - 1)
         elif start_index != -1:
-            self.values[start_index:] = [0] * (len(self.values) - start_index)
+            self.values = self.values[:start_index + 1]
         elif end_index != -1:
             self.values[:end_index + 1] = [0] * end_index
 

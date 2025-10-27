@@ -670,14 +670,16 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                     ds_item.note_dur[note_index]
                     for note_index, is_slur in slur_group
                 )
+                silence_time = cur_time + ds_item.ph_dur[ph_index]
                 for pitch_param in pitch_params:
-                    pitch_param.silent(cur_time, next_time)
+                    pitch_param.silent(cur_time, silence_time)
                 ph_index += 1
             elif text == "AP":
                 next_time = cur_time + sum(
                     ds_item.note_dur[note_index]
                     for note_index, is_slur in slur_group
                 )
+                silence_time = cur_time + ds_item.ph_dur[ph_index]
                 notes.append(
                     AcesSimpleNote(
                         start_time=cur_time,
@@ -687,7 +689,7 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                     )
                 )
                 for pitch_param in pitch_params:
-                    pitch_param.silent(cur_time, next_time)
+                    pitch_param.silent(cur_time, silence_time)
                 ph_index += 1
             else:
                 phoneme_buf = []
