@@ -75,13 +75,13 @@ class AceParam(BaseModel):
             i * self.hop_time + self.start_time for i in range(len(self.values))
         ]
         start_index = find_last_index(time_list, lambda x: x < start_time)
-        end_index = find_index(time_list, lambda x: x > end_time)
+        end_index = find_index(time_list, lambda x: x >= end_time)
         if start_index != -1 and end_index != -1:
             self.values[start_index + 1:end_index] = [0] * (end_index - start_index - 1)
         elif start_index != -1:
             self.values = self.values[:start_index + 1]
         elif end_index != -1:
-            self.values[:end_index + 1] = [0] * end_index
+            self.values[:end_index] = [0] * (end_index - 1)
 
 
 class AcesSimpleNote(AceSimpleSegment):

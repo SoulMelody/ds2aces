@@ -740,9 +740,11 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                         while len(phoneme_buf) < 2:
                             phone = ds_item.ph_seq[ph_index].rsplit("/", 1)[-1]
                             if phone in vowels_set and not len(phoneme_buf) and ds_item.ph_dur is not None:
-                                consonant_time_head.append(
-                                    ds_item.ph_dur[ph_index]
-                                )
+                                vowel_dur = ds_item.ph_dur[ph_index]
+                                consonant_time_head.append(vowel_dur)
+                                silence_time_start = cur_time - vowel_dur
+                                for pitch_param in pitch_params:
+                                    pitch_param.silent(silence_time_start, cur_time)
                             ph_index += 1
                             phoneme_buf.append(phone)
                             if len(phoneme_buf) == 1 and phone not in vowels_set:
