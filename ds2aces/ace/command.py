@@ -649,7 +649,7 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
     for ds_item in ds_project.root:
         cur_time = float(ds_item.offset)
         pitch_params = []
-        if param and ds_item.f0_timestep:
+        if param and ds_item.f0_timestep and ds_item.f0_seq:
             pitch_param = AceParam(start_time=cur_time, hop_time=ds_item.f0_timestep, values=[
                 hz2midi(f0) for f0 in ds_item.f0_seq
             ])
@@ -670,7 +670,7 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                     ds_item.note_dur[note_index]
                     for note_index, is_slur in slur_group
                 )
-                silence_time = cur_time + ds_item.ph_dur[ph_index]
+                silence_time = (cur_time + ds_item.ph_dur[ph_index]) if ds_item.ph_dur is not None else next_time
                 for pitch_param in pitch_params:
                     pitch_param.silent(cur_time, silence_time)
                 ph_index += 1
@@ -679,7 +679,7 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                     ds_item.note_dur[note_index]
                     for note_index, is_slur in slur_group
                 )
-                silence_time = cur_time + ds_item.ph_dur[ph_index]
+                silence_time = (cur_time + ds_item.ph_dur[ph_index]) if ds_item.ph_dur is not None else next_time
                 notes.append(
                     AcesSimpleNote(
                         start_time=cur_time,
