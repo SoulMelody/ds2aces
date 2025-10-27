@@ -654,7 +654,6 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                 hz2midi(f0) for f0 in ds_item.f0_seq
             ])
             pitch_params.append(pitch_param)
-        ds_item.ph_num = [ds_item.ph_num[-1], *ds_item.ph_num[:-1]]
         ph_index = 0
         midi_key = 69
         for lyric_index, slur_group in enumerate(
@@ -666,7 +665,6 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
             if not ds_item.note_dur:
                 break
             text = ds_item.text[lyric_index]
-            ph_num = ds_item.ph_num[lyric_index]
             if text == "SP":
                 next_time = cur_time + sum(
                     ds_item.note_dur[note_index]
@@ -674,6 +672,7 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                 )
                 for pitch_param in pitch_params:
                     pitch_param.silent(cur_time, next_time)
+                ph_index += 1
             elif text == "AP":
                 next_time = cur_time + sum(
                     ds_item.note_dur[note_index]
@@ -689,6 +688,7 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                 )
                 for pitch_param in pitch_params:
                     pitch_param.silent(cur_time, next_time)
+                ph_index += 1
             else:
                 phoneme_buf = []
                 consonant_time_head = []
@@ -700,9 +700,9 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                     if is_slur:
                         if len(phoneme_buf):
                             if len(phoneme_buf) == 1:
-                                pronunciation = phoneme_buf[0].rsplit("/", 1)[-1]
+                                pronunciation = phoneme_buf[0]
                             else:
-                                pronunciation = ds_phone_dict[" ".join(part.rsplit("/", 1)[-1] for part in phoneme_buf)]
+                                pronunciation = ds_phone_dict[" ".join(phoneme_buf)]
                             if pronunciation in ace_phone_dict["syllable_alias"]:
                                 pronunciation = ace_phone_dict["syllable_alias"][pronunciation]
                             if language != "ch" and pronunciation in ace_phone_dict["dict"]:
@@ -735,19 +735,22 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                             )
                         )
                     else:
-                        for phoneme_index in range(ph_index, ph_index + ph_num):
-                            phone = ds_item.ph_seq[phoneme_index]
-                            if phone in vowels_set and not consonant_time_head and ds_item.ph_dur is not None:
+                        while len(phoneme_buf) < 2:
+                            phone = ds_item.ph_seq[ph_index].rsplit("/", 1)[-1]
+                            if phone in vowels_set and not len(phoneme_buf) and ds_item.ph_dur is not None:
                                 consonant_time_head.append(
-                                    ds_item.ph_dur[phoneme_index]
+                                    ds_item.ph_dur[ph_index]
                                 )
+                            ph_index += 1
                             phoneme_buf.append(phone)
+                            if len(phoneme_buf) == 1 and phone not in vowels_set:
+                                break
                         next_time += note_dur
                 if len(phoneme_buf):
                     if len(phoneme_buf) == 1:
-                        pronunciation = phoneme_buf[0].rsplit("/", 1)[-1]
+                        pronunciation = phoneme_buf[0]
                     else:
-                        pronunciation = ds_phone_dict[" ".join(part.rsplit("/", 1)[-1] for part in phoneme_buf)]
+                        pronunciation = ds_phone_dict[" ".join(phoneme_buf)]
                     if pronunciation in ace_phone_dict["syllable_alias"]:
                         pronunciation = ace_phone_dict["syllable_alias"][pronunciation]
                     if language != "ch" and pronunciation in ace_phone_dict["dict"]:
@@ -768,7 +771,6 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                     )
                     phoneme_buf.clear()
                     consonant_time_head.clear()
-            ph_index += ph_num
             cur_time = next_time
         params.pitch.user.extend(pitch_params)
     output_dir.mkdir(parents=True, exist_ok=True)
