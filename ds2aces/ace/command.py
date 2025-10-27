@@ -699,7 +699,10 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                     note_dur = ds_item.note_dur[note_index]
                     if is_slur:
                         if len(phoneme_buf):
-                            pronunciation = ds_phone_dict[" ".join(part.rsplit("/", 1)[-1] for part in phoneme_buf)]
+                            if len(phoneme_buf) == 1:
+                                pronunciation = phoneme_buf[0].rsplit("/", 1)[-1]
+                            else:
+                                pronunciation = ds_phone_dict[" ".join(part.rsplit("/", 1)[-1] for part in phoneme_buf)]
                             if pronunciation in ace_phone_dict["syllable_alias"]:
                                 pronunciation = ace_phone_dict["syllable_alias"][pronunciation]
                             if language != "ch" and pronunciation in ace_phone_dict["dict"]:
@@ -741,7 +744,10 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                             phoneme_buf.append(phone)
                         next_time += note_dur
                 if len(phoneme_buf):
-                    pronunciation = ds_phone_dict[" ".join(part.rsplit("/", 1)[-1] for part in phoneme_buf)]
+                    if len(phoneme_buf) == 1:
+                        pronunciation = phoneme_buf[0].rsplit("/", 1)[-1]
+                    else:
+                        pronunciation = ds_phone_dict[" ".join(part.rsplit("/", 1)[-1] for part in phoneme_buf)]
                     if pronunciation in ace_phone_dict["syllable_alias"]:
                         pronunciation = ace_phone_dict["syllable_alias"][pronunciation]
                     if language != "ch" and pronunciation in ace_phone_dict["dict"]:
