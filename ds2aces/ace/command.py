@@ -13,16 +13,18 @@ import re
 import time
 import uuid
 from urllib.parse import urljoin
-from typing import Literal
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypeAlias
 
 import asyncio_oss
 import anyio
 import httpx
 import more_itertools
 import oss2
+import pypinyin
 import soundfile as sf
 import tenacity
 import typer
+import wanakana
 from loguru import logger
 from Crypto.Cipher import AES
 from Crypto.Util import Padding
@@ -54,12 +56,16 @@ from ds2aces.ds.phoneme_dict import get_ds_phone_dict, get_vowels_set
 from ds2aces.utils.music_math import hz2midi, note2midi
 from ds2aces.utils.search import find_last_index
 
-app = typer.Typer(pretty_exceptions_enable=False)
+if TYPE_CHECKING:
+    import numpy as np
+
+app = typer.Typer()
 
 CENTS_RE = re.compile(r"[+-]\d+$")
+AcesItem: TypeAlias = dict[str, Any]
+AcesNoteItem: TypeAlias = dict[str, Any]
 
-
-def cut_aces(aces):
+def cut_aces(aces: AcesItem) -> list[AcesItem]:
     version = aces["version"]
     original_note_list = aces["notes"]
     piece_params = aces.get("piece_params", {})
@@ -71,7 +77,7 @@ def cut_aces(aces):
         else:
             filtered_list.append(note)
 
-    def corase_cut(list_to_cut):
+    def corase_cut(list_to_cut: list[AcesNoteItem]) -> list[list[AcesNoteItem]]:
         corase_result = []
         temp_list = []
         for i in range(len(list_to_cut)):
@@ -91,7 +97,7 @@ def cut_aces(aces):
 
         return corase_result
 
-    def simple_cut(list_to_cut):
+    def simple_cut(list_to_cut: list[AcesNoteItem]) -> list[list[AcesNoteItem]]:
         middle_time = (float(list_to_cut[0]["start_time"]) + float(list_to_cut[-1]["end_time"]))/2
 
         cut_index = 0
@@ -107,19 +113,18 @@ def cut_aces(aces):
 
         return [half_1, half_2]
 
-    def fine_cut(list_to_cut, max_length):
+    def fine_cut(list_to_cut: list[AcesNoteItem], max_length: float) -> list[list[AcesNoteItem]]:
         list_end = float(list_to_cut[-1].get("end_time"))
         list_start = float(list_to_cut[0].get("start_time"))
         list_length = list_end - list_start
         if list_length <= max_length:
             return [list_to_cut]
-        else:
-            halves = simple_cut(list_to_cut)
-            result = []
-            for half in halves:
-                if half: 
-                    result.extend(fine_cut(half, max_length))
-            return result
+        halves = simple_cut(list_to_cut)
+        result = []
+        for half in halves:
+            if half: 
+                result.extend(fine_cut(half, max_length))
+        return result
 
     corase_list = corase_cut(filtered_list)
     fine_list = []
@@ -201,20 +206,17 @@ def cut_aces(aces):
     return aces_list
 
 
-def filter_short_note(aces):
-    filtered_notes = []
-    for note in aces["notes"]:
-        if note["end_time"] - note["start_time"] > MIN_NOTE_DURATION:
-            filtered_notes.append(note)
+def filter_short_note(aces: AcesItem) -> AcesItem:
+    filtered_notes = [
+        note
+        for note in aces["notes"]
+        if note["end_time"] - note["start_time"] > MIN_NOTE_DURATION
+    ]
     aces["notes"] = filtered_notes
     return aces
 
 
-async def render_aces(aces_file: pathlib.Path, router_id: int):
-    client = await pre_login()
-
-    if client is None:
-        raise ValueError("pre_login failed")
+async def render_aces(client: httpx.AsyncClient, aces_file: pathlib.Path, router_id: int) -> None:
     as_token = await fetch_as_token(client)  
     if not as_token:
         raise ValueError("fetch as token failed")
@@ -275,7 +277,7 @@ async def fetch_router_config(client: httpx.AsyncClient, echo: bool = False) -> 
     stop=tenacity.stop_after_attempt(3),
     reraise=True,
 )
-async def send_request(client, compose_body, files, router_url):
+async def send_request(client: httpx.AsyncClient, compose_body: AceEngineBody, files: dict[str, tuple[str, BinaryIO, str]], router_url: str) -> httpx.Response:
     return await client.post(
         router_url,
         headers={
@@ -286,7 +288,7 @@ async def send_request(client, compose_body, files, router_url):
     )
 
 
-async def download_and_open_audio(client: httpx.AsyncClient, url): 
+async def download_and_open_audio(client: httpx.AsyncClient, url: str) -> tuple[np.ndarray, int]:
     response = await client.get(url)
     response.raise_for_status()
 
@@ -294,7 +296,7 @@ async def download_and_open_audio(client: httpx.AsyncClient, url):
         data, samplerate = sf.read(file)
         return data, samplerate
 
-async def one_piece_compose(client: httpx.AsyncClient, ace_token: str, aces: dict, router_url: str):
+async def one_piece_compose(client: httpx.AsyncClient, ace_token: str, aces: dict, router_url: str) -> tuple[float, np.ndarray, int]:
     user_config = read_ace_user_info_config()
     user_id = json.loads(
         json.loads(user_config.get("user_info_group", "user_info_key"))
@@ -327,7 +329,7 @@ async def one_piece_compose(client: httpx.AsyncClient, ace_token: str, aces: dic
 
     return pst, audio_data, samplerate
 
-async def rendering_ace_list(client, ace_list, save_to_path, as_token, router_id):
+async def rendering_ace_list(client: httpx.AsyncClient, ace_list: list[AcesItem], save_to_path: pathlib.Path, as_token: str, router_id: int) -> None:
     vocal_offset = None
     concat_audio = []
 
@@ -366,7 +368,7 @@ async def rendering_ace_list(client, ace_list, save_to_path, as_token, router_id
     logger.info(explanation)
 
 
-async def download_phoneme_data(client: httpx.AsyncClient) -> dict:
+async def download_phoneme_data(client: httpx.AsyncClient) -> dict[str, Any]:
     config_resp = await client.get(
         urljoin(ACE_API_BASE_URL, "/api/as/conf/client"),
     )
@@ -487,7 +489,7 @@ async def fetch_as_token(client: httpx.AsyncClient) -> str:
 
 
 @app.command()
-def login(phone_number):
+def login(phone_number: str) -> None:
     is_email = "@" in phone_number
     client = httpx.Client(follow_redirects=True, timeout=10, headers=default_headers())
     typer.echo(f"Login using {phone_number}")
@@ -571,7 +573,7 @@ def login(phone_number):
             write_ace_user_info_config(user_info_config)
 
 
-async def fetch_singers(client: httpx.AsyncClient | None = None):
+async def fetch_singers(client: httpx.AsyncClient | None = None) -> None:
     if client is None:
         client = await pre_login()
     if client is None:
@@ -600,11 +602,20 @@ async def fetch_singers(client: httpx.AsyncClient | None = None):
             logger.error(f"fetch singers failed: {response.text}")
 
 @app.command()
-def singers():
+def singers() -> None:
     anyio.run(fetch_singers)
 
 
-async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: bool = False, render: bool = False, language: Literal["ch", "en", "jp", "spa"] = "ch"):
+def g2p(lyric: str, language: Literal["ch", "en", "jp", "spa"] = "ch") -> str:
+    if language == "ch":
+        return " ".join(pypinyin.lazy_pinyin(lyric, style=pypinyin.Style.NORMAL))
+    elif language == "jp":
+        return wanakana.to_romaji(lyric, custom_romaji_mapping={"っ": "cl"})
+    else:
+        raise NotImplementedError(f"Language {language} is not supported yet")
+
+
+async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: bool = False, render: bool = False, language: Literal["ch", "en", "jp", "spa"] = "ch") -> None:
     client = await pre_login()
     if not client:
         logger.error("login failed")
@@ -624,27 +635,30 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
     notes = []
     await fetch_singers(client)
     seed_id = typer.prompt("Please input the seed id", default=DEFAULT_SEED)
-    mix_info = None
-    mix_info_resp = await client.post(
-        urljoin(
-            ACE_API_BASE_URL,
-            "/api/as/voice/mix/str/v2",
-        ),
-        json={"seeds": [
-            {"s": 1, "t": 1, "s_id": int(seed_id)},
-        ]},
-    )
-    if not mix_info_resp.is_error:
-        mix_info_data = json.loads(mix_info_resp.text)
-        if mix_info_data["code"] == 200:
-            mix_info = mix_info_data["data"][
-                "mix_info"
-            ]
-        elif mix_info_data.get("error"):
-            logger.error(mix_info_data["error"])
-            return
-    await fetch_router_config(client, echo=True)
-    router_id = int(typer.prompt("Please input the router id", default=1))
+    if render:
+        mix_info_resp = await client.post(
+            urljoin(
+                ACE_API_BASE_URL,
+                "/api/as/voice/mix/str/v2",
+            ),
+            json={"seeds": [
+                {"s": 1, "t": 1, "s_id": int(seed_id)},
+            ]},
+        )
+        if not mix_info_resp.is_error:
+            mix_info_data = json.loads(mix_info_resp.text)
+            if mix_info_data["code"] == 200:
+                mix_info = mix_info_data["data"][
+                    "mix_info"
+                ]
+            elif mix_info_data.get("error"):
+                logger.error(mix_info_data["error"])
+                return
+        await fetch_router_config(client, echo=True)
+        router_id = int(typer.prompt("Please input the router id", default=1))
+    else:
+        mix_info = ""
+        router_id = 1
     params = AcesPieceParams()
     for ds_item in ds_project.root:
         cur_time = float(ds_item.offset)
@@ -704,7 +718,11 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                             if len(phoneme_buf) == 1:
                                 pronunciation = phoneme_buf[0]
                             else:
-                                pronunciation = ds_phone_dict[" ".join(phoneme_buf)]
+                                ds_phone = " ".join(phoneme_buf)
+                                if ds_phone in ds_phone_dict:
+                                    pronunciation = ds_phone_dict[ds_phone]
+                                else:
+                                    pronunciation = g2p(text, language)
                             if pronunciation in ace_phone_dict["syllable_alias"]:
                                 pronunciation = ace_phone_dict["syllable_alias"][pronunciation]
                             if language != "ch" and pronunciation in ace_phone_dict["dict"]:
@@ -754,7 +772,11 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                     if len(phoneme_buf) == 1:
                         pronunciation = phoneme_buf[0]
                     else:
-                        pronunciation = ds_phone_dict[" ".join(phoneme_buf)]
+                        ds_phone = " ".join(phoneme_buf)
+                        if ds_phone in ds_phone_dict:
+                            pronunciation = ds_phone_dict[ds_phone]
+                        else:
+                            pronunciation = g2p(text, language)
                     if pronunciation in ace_phone_dict["syllable_alias"]:
                         pronunciation = ace_phone_dict["syllable_alias"][pronunciation]
                     if language != "ch" and pronunciation in ace_phone_dict["dict"]:
@@ -789,7 +811,7 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
     )
     logger.info(f"Successfully saved to '{aces_file.absolute()}'")
     if render:
-        await render_aces(aces_file, router_id)
+        await render_aces(client, aces_file, router_id)
 
 @app.command()
 def ds2aces(
@@ -800,7 +822,7 @@ def ds2aces(
     param: bool = typer.Option(True),
     render: bool = typer.Option(False),
     language: Literal["ch", "en", "jp", "spa"] = "ch",
-):
+) -> None:
     if language not in ["ch", "jp"]: # TODO: support other languages
         raise NotImplementedError("Only Chinese and Japanese are supported")
     anyio.run(ds_to_aces, in_path, output_dir, param, render, language)
@@ -810,7 +832,7 @@ async def transcribe_asynchronous(
     song_path: pathlib.Path,
     language: Literal["ch", "en", "jp"] = "ch",
     version: str = "1.0",
-):
+) -> None:
     client = await pre_login()
     if client is None:
         return
@@ -878,8 +900,7 @@ def transcribe(
     song_path: pathlib.Path,
     language: Literal["ch", "en", "jp"] = "ch",
     version: str = "1.0",
-):
-
+) -> None:
     anyio.run(
         transcribe_asynchronous,
         song_path,
