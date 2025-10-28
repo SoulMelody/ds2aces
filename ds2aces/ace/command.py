@@ -684,7 +684,7 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                     ds_item.note_dur[note_index]
                     for note_index, is_slur in slur_group
                 )
-                silence_time = (cur_time + ds_item.ph_dur[ph_index]) if ds_item.ph_dur is not None else next_time
+                silence_time = (cur_time + ds_item.ph_dur[ph_index]) if ds_item.ph_dur is not None and len(ds_item.ph_dur) > ph_index else next_time
                 for pitch_param in pitch_params:
                     pitch_param.silent(cur_time, silence_time)
                 ph_index += 1
@@ -693,7 +693,7 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                     ds_item.note_dur[note_index]
                     for note_index, is_slur in slur_group
                 )
-                silence_time = (cur_time + ds_item.ph_dur[ph_index]) if ds_item.ph_dur is not None else next_time
+                silence_time = (cur_time + ds_item.ph_dur[ph_index]) if ds_item.ph_dur is not None and len(ds_item.ph_dur) > ph_index else next_time
                 notes.append(
                     AcesSimpleNote(
                         start_time=cur_time,
