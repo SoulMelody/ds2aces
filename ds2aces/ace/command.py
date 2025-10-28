@@ -500,7 +500,7 @@ def login(phone_number):
             json={"email": phone_number},
         )
         resp_data = response.json()
-        password = typer.prompt("Please input the password")
+        password = typer.prompt("Please input the password", hide_input=True)
         if not resp_data["data"].get("email_exist"):
             client.get(
                 urljoin(
