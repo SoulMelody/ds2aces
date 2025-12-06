@@ -627,7 +627,7 @@ def singers() -> None:
     anyio.run(fetch_singers)
 
 
-def g2p(lyric: str, language: Literal["ch", "en", "jp", "spa"] = "ch") -> str:
+def g2p(lyric: str, language: Literal["ch", "en", "jp", "spa", "ko", "pt", "fr", "it"] = "ch") -> str:
     if language == "ch":
         return " ".join(pypinyin.lazy_pinyin(lyric, style=pypinyin.Style.NORMAL))
     elif language == "jp":
@@ -842,7 +842,7 @@ def ds2aces(
     ),
     param: bool = typer.Option(True),
     render: bool = typer.Option(False),
-    language: Literal["ch", "en", "jp", "spa"] = "ch",
+    language: Literal["ch", "en", "jp", "spa", "ko", "pt", "fr", "it"] = "ch",
 ) -> None:
     if language not in ["ch", "jp"]: # TODO: support other languages
         raise NotImplementedError("Only Chinese and Japanese are supported")
@@ -851,7 +851,7 @@ def ds2aces(
 
 async def transcribe_asynchronous(
     song_path: pathlib.Path,
-    language: Literal["ch", "en", "jp"] = "ch",
+    language: Literal["ch", "en", "jp", "es", "ita", "fra", "por", "kor", "note", "unknown"] = "ch",
     version: str = "1.0",
 ) -> None:
     client = await pre_login()
@@ -890,6 +890,9 @@ async def transcribe_asynchronous(
         if upload_result.status != 200:
             raise ValueError("Upload failed")
 
+    extra_kwargs = {
+        "format": "json"
+    } if version == "2.0" else {}
     resp = await client.post(
         vt_api_url,
         json={
@@ -898,6 +901,7 @@ async def transcribe_asynchronous(
             "request_id": f"{user_id}_{version}_{language}_{song_hash}",
             "to_lan": language,
             "version": version,
+            **extra_kwargs,
         },
         headers={
             "token": vt_api_token,
@@ -908,6 +912,7 @@ async def transcribe_asynchronous(
         logger.info("Transcription success")
         logger.info(resp_data["data"]["file_url"])
     else:
+        # TODO: add integration with https://github.com/SoulMelody/python-timsdk
         logger.info("Please wait for the transcription result")
         if language == "ch":
             language = "zh"
@@ -919,7 +924,7 @@ async def transcribe_asynchronous(
 @app.command()
 def transcribe(
     song_path: pathlib.Path,
-    language: Literal["ch", "en", "jp"] = "ch",
+    language: Literal["ch", "en", "jp", "es", "ita", "fra", "por", "kor", "note", "unknown"] = "ch",
     version: str = "1.0",
 ) -> None:
     anyio.run(

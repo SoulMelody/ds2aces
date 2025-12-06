@@ -70,8 +70,8 @@ class AceEngineBodyV2(BaseModel):
     response_type: str
     context_id: str
     mix_info: str
-    inpainting_time_list: list = Field(default_factory=list)
-    delete_time_list: list = Field(default_factory=list)
+    inpainting_time_list: list[AceSimpleSegment] = Field(default_factory=list)
+    delete_time_list: list[AceSimpleSegment] = Field(default_factory=list)
 
 
 class AceParam(BaseModel):
@@ -98,7 +98,7 @@ class AcesSimpleNote(AceSimpleSegment):
     pitch: int = 0
     phone: list[str] = Field(default_factory=list)
     syllable: str | None = ""
-    language: Literal["ch", "en", "jp", "spa"] = "ch"
+    language: Literal["ch", "en", "jp", "spa", "ko", "pt", "fr", "it"] = "ch"
     consonant_time_head: list[float] | None = None
     consonant_time_tail: list[float] | None = None
 
