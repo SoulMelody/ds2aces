@@ -25,6 +25,7 @@ import soundfile as sf
 import tenacity
 import typer
 import wanakana
+from httpx._content import encode_multipart_data
 from loguru import logger
 from Crypto.Cipher import AES
 from Crypto.Util import Padding
@@ -46,6 +47,7 @@ from ds2aces.ace.constants import DEFAULT_SEED, MIN_NOTE_DURATION, MIN_SILENCE_D
 from ds2aces.ace.model import (
     AceParam,
     AceEngineBody,
+    AceEngineBodyV2,
     AcesPieceParams,
     AcesSimpleNote,
     AcesProject,
@@ -240,12 +242,15 @@ async def fetch_router_config(client: httpx.AsyncClient, echo: bool = False) -> 
             ACE_API_BASE_URL,
             "/api/as/voice/seed/v3",
         ),
+        params={
+            "version": "2"
+        }
     )
     if not router_response.is_error:
         resp_data = router_response.json()
         if resp_data["code"] == 200:
             code2router_url = {
-                router["id"]: router["router"]
+                router["id"]: (router["router"], router["version"])
                 for router in resp_data["data"]["router_list"]
                 if router["is_show"]
             }
@@ -255,12 +260,14 @@ async def fetch_router_config(client: httpx.AsyncClient, echo: bool = False) -> 
                 table.add_column("ID", justify="left", style="cyan")
                 table.add_column("Router Name", justify="left", style="cyan")
                 table.add_column("URL", justify="left", style="cyan")
+                table.add_column("Version", justify="left", style="cyan")
                 table.add_column("Supported Languages", justify="left", style="cyan")
                 for router in resp_data["data"]["router_list"]:
                     table.add_row(
                         str(router["id"]),
                         router["router_name"],
                         router["router"],
+                        str(router["version"]),
                         ", ".join(router["support_lan_list"]),
                     )
                 console.print(table)
@@ -277,15 +284,17 @@ async def fetch_router_config(client: httpx.AsyncClient, echo: bool = False) -> 
     stop=tenacity.stop_after_attempt(3),
     reraise=True,
 )
-async def send_request(client: httpx.AsyncClient, compose_body: AceEngineBody, files: dict[str, tuple[str, BinaryIO, str]], router_url: str) -> httpx.Response:
-    return await client.post(
-        router_url,
-        headers={
-            "MIME-Version": "1.0"
-        },
+async def send_request(client: httpx.AsyncClient, compose_body: AceEngineBody | AceEngineBodyV2, files: dict[str, tuple[str, BinaryIO, str]], router_url: str) -> httpx.Response:
+    form_boundary = f"----WebKitFormBoundary{time.time()}"
+    request = client.build_request("POST", router_url)
+    headers, stream = encode_multipart_data(
         data=compose_body.model_dump(mode="json"),
         files=files,
+        boundary=form_boundary.encode()
     )
+    request.stream = stream
+    request.headers.update(headers)
+    return await client.send(request)
 
 
 async def download_and_open_audio(client: httpx.AsyncClient, url: str) -> tuple[np.ndarray, int]:
@@ -296,7 +305,7 @@ async def download_and_open_audio(client: httpx.AsyncClient, url: str) -> tuple[
         data, samplerate = sf.read(file)
         return data, samplerate
 
-async def one_piece_compose(client: httpx.AsyncClient, ace_token: str, aces: dict, router_url: str) -> tuple[float, np.ndarray, int]:
+async def one_piece_compose(client: httpx.AsyncClient, ace_token: str, aces: dict, router_url: str, router_version: int) -> tuple[float, np.ndarray, int]:
     user_config = read_ace_user_info_config()
     user_id = json.loads(
         json.loads(user_config.get("user_info_group", "user_info_key"))
@@ -304,17 +313,26 @@ async def one_piece_compose(client: httpx.AsyncClient, ace_token: str, aces: dic
     timestamp = int(time.time() * 1000)
     upload_path = f"{user_id}_{timestamp}.aces"
 
-    compose_body = AceEngineBody(
-        compress_type="zstd",
-        flag=".aces",
-        ace_token=ace_token,
-        pipeline_business=2,
-    )
+    if router_version == 1:
+        compose_body = AceEngineBody(
+            compress_type="zstd",
+            flag=".aces",
+            ace_token=ace_token,
+            pipeline_business=2,
+        )
+    else:
+        compose_body = AceEngineBodyV2(
+            ace_token=ace_token,
+            session_id=str(timestamp),
+            context_id="0",
+            response_type="2",
+            mix_info=aces["mix_info"] if "mix_info" in aces else "",
+        )
     # logger.debug(aces)
     files = {
         "file": (
             upload_path,
-            io.BytesIO(compress_ace_segment(json.dumps(aces))),
+            io.BytesIO(compress_ace_segment(json.dumps(aces), raw=router_version>=2)),
             "application/octet-stream",
         )
     }
@@ -336,16 +354,15 @@ async def rendering_ace_list(client: httpx.AsyncClient, ace_list: list[AcesItem]
     code2router_url = await fetch_router_config(client)
     if not code2router_url:
         return
-    router_url = code2router_url[router_id]
+    router_url, router_version = code2router_url[router_id]
 
     if not ace_list:
         return
     for aces in track(ace_list, description="Rendering ACE Sequence files..."):
-        pst, audio_data, samplerate = await one_piece_compose(client, as_token, aces, router_url)
+        pst, audio_data, samplerate = await one_piece_compose(client, as_token, aces, router_url, router_version)
 
         if vocal_offset is None:
             vocal_offset = pst
-            concat_audio.extend(audio_data)
         else:
             start_index = int((pst - vocal_offset) * samplerate)
 
@@ -353,8 +370,7 @@ async def rendering_ace_list(client: httpx.AsyncClient, ace_list: list[AcesItem]
                 concat_audio.extend([0] * (start_index - len(concat_audio)))
             else:
                 concat_audio = concat_audio[:start_index]
-
-            concat_audio.extend(audio_data)
+        concat_audio.extend(audio_data)
 
     sf.write(save_to_path, concat_audio, samplerate)
     logger.info(f"In relation to the project, the vocal offset is: {vocal_offset}")
@@ -583,16 +599,21 @@ async def fetch_singers(client: httpx.AsyncClient | None = None) -> None:
             ACE_API_BASE_URL,
             "/api/as/singer/list/v2",
         ),
+        params={
+            "version": "2.1"
+        }
     )
     if not response.is_error:
         singers_data = response.json()
         if singers_data["code"] == 200:
             console = Console(color_system="256")
             table = Table(show_header=True, header_style="bold magenta")
+            table.add_column("Code", justify="left", style="cyan")
             table.add_column("Seed", justify="left", style="cyan")
             table.add_column("Singer Name", justify="left", style="cyan")
             for singer_data in singers_data["data"]["official"]["singers"]:
                 table.add_row(
+                    str(singer_data["code"]),
                     str(singer_data["seed_id"]),
                     singer_data["name"],
                 )
@@ -639,18 +660,18 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
         mix_info_resp = await client.post(
             urljoin(
                 ACE_API_BASE_URL,
-                "/api/as/voice/mix/str/v2",
+                "/api/as/voice/mix/str/v3",
             ),
-            json={"seeds": [
-                {"s": 1, "t": 1, "s_id": int(seed_id)},
+            json={"seeds_list": [
+                [{"s": 1, "t": 1, "s_id": int(seed_id)}],
             ]},
         )
         if not mix_info_resp.is_error:
             mix_info_data = json.loads(mix_info_resp.text)
             if mix_info_data["code"] == 200:
                 mix_info = mix_info_data["data"][
-                    "mix_info"
-                ]
+                    "mix_info_list"
+                ][0]
             elif mix_info_data.get("error"):
                 logger.error(mix_info_data["error"])
                 return

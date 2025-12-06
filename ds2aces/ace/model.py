@@ -64,6 +64,15 @@ class AceEngineBody(BaseModel):
     pipeline_business: int
     flag: str
 
+class AceEngineBodyV2(BaseModel):
+    ace_token: str
+    session_id: str
+    response_type: str
+    context_id: str
+    mix_info: str
+    inpainting_time_list: list = Field(default_factory=list)
+    delete_time_list: list = Field(default_factory=list)
+
 
 class AceParam(BaseModel):
     hop_time: float = MIN_NOTE_DURATION
@@ -103,6 +112,11 @@ class AcesPieceParam(BaseModel):
     envelope: list[AceParam] = Field(default_factory=list)
     user: list[AceParam] = Field(default_factory=list)
 
+
+class AcesModeParam(BaseModel):
+    name: Literal["power", "soft", "airy", "chest"]
+    value: AceParam = Field(default_factory=AceParam)
+
 class AcesPieceParams(BaseModel):
     air: AcesPieceParam = Field(default_factory=AcesPieceParam, title="气声")
     energy: AcesPieceParam = Field(default_factory=AcesPieceParam, title="力度")
@@ -116,10 +130,11 @@ class AcesProject(BaseModel):
     debug_info: AceDebugInfo = Field(default_factory=AceDebugInfo)
     global_info: AceGlobalInfo = Field(default_factory=AceGlobalInfo)
     notes: list[AcesSimpleNote] = Field(default_factory=list)
+    mode_params: list[AcesModeParam] = Field(default_factory=list)
     piece_params: AcesPieceParams = Field(default_factory=AcesPieceParams)
     pad: AcesPadNotes | None = None
     version: float = 1.1
-    mix_info: str
+    mix_info: str | None = None
 
 
 class AcesList(RootModel[list[AcesProject]]):
@@ -127,12 +142,12 @@ class AcesList(RootModel[list[AcesProject]]):
 
 
 def decompress_ace_segment(src: bytes, raw: bool = False) -> str:
-    raw_content = base64.b64decode(src.strip().strip(b'"'))
+    raw_content = base64.b64decode(src.strip().strip(b'"')) if not raw else src
     decompressed = zstd.decompress(raw_content)
     return decompressed.decode("utf-8")
 
 
-def compress_ace_segment(src: str) -> bytes:
+def compress_ace_segment(src: str, raw: bool = False) -> bytes:
     raw_content = src.encode("utf-8")
     compressed = zstd.compress(raw_content)
-    return base64.b64encode(compressed)
+    return base64.b64encode(compressed) if not raw else compressed
