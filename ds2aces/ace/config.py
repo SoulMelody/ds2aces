@@ -1,7 +1,9 @@
 import configparser
-import pathlib
 
-ACE_CONFIG_ROOT = pathlib.Path("~").expanduser() / "ACE_Studio/"
+import platformdirs
+
+
+ACE_CONFIG_ROOT = platformdirs.AppDirs("ACE Studio", "TimeDomain", roaming=True).user_config_path
 
 ace_studio_lock_file = ACE_CONFIG_ROOT / "ace-studio.lock"
 ace_login_config_path = ACE_CONFIG_ROOT / "UserDefaults/login_ini"

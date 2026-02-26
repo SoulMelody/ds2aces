@@ -5,7 +5,7 @@ from loguru import logger
 
 from ds2aces.ace.config import ace_studio_lock_file
 
-__VERSION__ = "2.0.0"
+__VERSION__ = "2.0.6"
 
 def download_and_setup_ffmpeg():
     import portable_ffmpeg

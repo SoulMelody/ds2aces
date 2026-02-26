@@ -611,7 +611,7 @@ async def fetch_singers(client: httpx.AsyncClient | None = None) -> None:
             table.add_column("Code", justify="left", style="cyan")
             table.add_column("Seed", justify="left", style="cyan")
             table.add_column("Singer Name", justify="left", style="cyan")
-            for singer_data in singers_data["data"]["official"]["singers"]:
+            for singer_data in sorted(singers_data["data"]["official"]["singers"], key=lambda x: x["code"]):
                 table.add_row(
                     str(singer_data["code"]),
                     str(singer_data["seed_id"]),
