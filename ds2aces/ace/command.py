@@ -43,7 +43,7 @@ from ds2aces.ace.config import (
     write_ace_login_config,
     write_ace_user_info_config,
 )
-from ds2aces.ace.constants import DEFAULT_SEED, MIN_NOTE_DURATION, MIN_SILENCE_DURATION, MAX_PIECE_DURATION
+from ds2aces.ace.constants import DEFAULT_SEED, MIN_NOTE_DURATION, MIN_SILENCE_DURATION, MAX_PIECE_DURATION, PIECE_SPLIT_GAP_PASS1, PIECE_SPLIT_GAP_PASS2
 from ds2aces.ace.model import (
     AceParam,
     AceEngineBody,
@@ -56,7 +56,6 @@ from ds2aces.ace.model import (
 from ds2aces.ds.ds_file import DsProject
 from ds2aces.ds.phoneme_dict import get_ds_phone_dict, get_vowels_set
 from ds2aces.utils.music_math import hz2midi, note2midi
-from ds2aces.utils.search import find_last_index
 
 if TYPE_CHECKING:
     import numpy as np
@@ -99,32 +98,59 @@ def cut_aces(aces: AcesItem) -> list[AcesItem]:
 
         return corase_result
 
-    def simple_cut(list_to_cut: list[AcesNoteItem]) -> list[list[AcesNoteItem]]:
-        middle_time = (float(list_to_cut[0]["start_time"]) + float(list_to_cut[-1]["end_time"]))/2
+    def gap_size(prev: AcesNoteItem, nxt: AcesNoteItem) -> float:
+        return float(nxt["start_time"]) - float(prev["end_time"])
 
-        cut_index = 0
-        cut_index = min(
-            range(len(list_to_cut)),
-            key=lambda x: abs(float(list_to_cut[x]["start_time"]) - middle_time)
+    def candidate_cut_indices(list_to_cut: list[AcesNoteItem], min_gap: float) -> list[int]:
+        # cut_index points at the first note of the right half; only at real gaps
+        # and never inside a slur group (which would split a syllable).
+        indices = []
+        for i in range(1, len(list_to_cut)):
+            if list_to_cut[i]["type"] == "slur":
+                continue
+            if gap_size(list_to_cut[i - 1], list_to_cut[i]) >= min_gap:
+                indices.append(i)
+        return indices
+
+    def best_cut(list_to_cut: list[AcesNoteItem], indices: list[int], target: float) -> int:
+        # ACE Studio's score (decompile/140954F70.c:190,288,565,656):
+        # score = (target - left_len) * gap_size, maximised. Equivalent to
+        # preferring large gaps that sit near the middle of the segment.
+        list_start = float(list_to_cut[0]["start_time"])
+        return max(
+            indices,
+            key=lambda i: (
+                target - (float(list_to_cut[i - 1]["end_time"]) - list_start)
+            ) * gap_size(list_to_cut[i - 1], list_to_cut[i]),
         )
-        if list_to_cut[cut_index]["type"] == "slur":
-            cut_index = find_last_index(list_to_cut[:cut_index-1], lambda x: x["type"] != "slur")
 
-        half_1 = list_to_cut[:cut_index]
-        half_2 = list_to_cut[cut_index:]
+    def simple_cut(list_to_cut: list[AcesNoteItem]) -> list[list[AcesNoteItem]]:
+        target = (float(list_to_cut[-1]["end_time"]) - float(list_to_cut[0]["start_time"])) / 2
 
-        return [half_1, half_2]
+        # Multi-pass fallback (mirrors decompile/140954F70.c passes):
+        for min_gap in (PIECE_SPLIT_GAP_PASS1, PIECE_SPLIT_GAP_PASS2, 0.0):
+            indices = candidate_cut_indices(list_to_cut, min_gap)
+            if indices:
+                cut_index = best_cut(list_to_cut, indices, target)
+                return [list_to_cut[:cut_index], list_to_cut[cut_index:]]
+
+        # Last-resort hard cut: find a non-slur boundary closest to the time midpoint.
+        middle_time = float(list_to_cut[0]["start_time"]) + target
+        cut_index = min(
+            (i for i in range(1, len(list_to_cut)) if list_to_cut[i]["type"] != "slur"),
+            key=lambda x: abs(float(list_to_cut[x]["start_time"]) - middle_time),
+            default=len(list_to_cut) // 2,
+        )
+        return [list_to_cut[:cut_index], list_to_cut[cut_index:]]
 
     def fine_cut(list_to_cut: list[AcesNoteItem], max_length: float) -> list[list[AcesNoteItem]]:
-        list_end = float(list_to_cut[-1].get("end_time"))
-        list_start = float(list_to_cut[0].get("start_time"))
-        list_length = list_end - list_start
-        if list_length <= max_length:
+        list_length = float(list_to_cut[-1]["end_time"]) - float(list_to_cut[0]["start_time"])
+        if list_length <= max_length or len(list_to_cut) < 2:
             return [list_to_cut]
         halves = simple_cut(list_to_cut)
         result = []
         for half in halves:
-            if half: 
+            if half:
                 result.extend(fine_cut(half, max_length))
         return result
 
@@ -705,16 +731,12 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                     ds_item.note_dur[note_index]
                     for note_index, is_slur in slur_group
                 )
-                silence_time = (cur_time + ds_item.ph_dur[ph_index]) if ds_item.ph_dur is not None and len(ds_item.ph_dur) > ph_index else next_time
-                for pitch_param in pitch_params:
-                    pitch_param.silent(cur_time, silence_time)
                 ph_index += 1
             elif text == "AP":
                 next_time = cur_time + sum(
                     ds_item.note_dur[note_index]
                     for note_index, is_slur in slur_group
                 )
-                silence_time = (cur_time + ds_item.ph_dur[ph_index]) if ds_item.ph_dur is not None and len(ds_item.ph_dur) > ph_index else next_time
                 notes.append(
                     AcesSimpleNote(
                         start_time=cur_time,
@@ -723,8 +745,6 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                         type="br",
                     )
                 )
-                for pitch_param in pitch_params:
-                    pitch_param.silent(cur_time, silence_time)
                 ph_index += 1
             else:
                 phoneme_buf = []
