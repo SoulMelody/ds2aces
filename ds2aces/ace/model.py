@@ -19,7 +19,6 @@ for zstd_backend in (
     "zstd",
     "pyzstd",
     "zstandard",
-    "cramjam",
     "numcodecs.zstd",
 ):
     with contextlib.suppress(ImportError):
