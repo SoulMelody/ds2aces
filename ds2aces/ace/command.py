@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypeAlias
 
 import asyncio_oss
 import anyio
-import httpx
+import httpx2
 import more_itertools
 import oss2
 import pypinyin
@@ -25,7 +25,7 @@ import soundfile as sf
 import tenacity
 import typer
 import wanakana
-from httpx._content import encode_multipart_data
+from httpx2._content import encode_multipart_data
 from loguru import logger
 from Crypto.Cipher import AES
 from Crypto.Util import Padding
@@ -244,7 +244,7 @@ def filter_short_note(aces: AcesItem) -> AcesItem:
     return aces
 
 
-async def render_aces(client: httpx.AsyncClient, aces_file: pathlib.Path, router_id: int) -> None:
+async def render_aces(client: httpx2.AsyncClient, aces_file: pathlib.Path, router_id: int) -> None:
     as_token = await fetch_as_token(client)  
     if not as_token:
         raise ValueError("fetch as token failed")
@@ -262,7 +262,7 @@ async def render_aces(client: httpx.AsyncClient, aces_file: pathlib.Path, router
     await rendering_ace_list(client, cutted_aces, aces_file.with_suffix(".wav"), as_token, router_id)
 
 
-async def fetch_router_config(client: httpx.AsyncClient, echo: bool = False) -> dict[int, str]:
+async def fetch_router_config(client: httpx2.AsyncClient, echo: bool = False) -> dict[int, str]:
     router_response = await client.get(
         urljoin(
             ACE_API_BASE_URL,
@@ -310,7 +310,7 @@ async def fetch_router_config(client: httpx.AsyncClient, echo: bool = False) -> 
     stop=tenacity.stop_after_attempt(3),
     reraise=True,
 )
-async def send_request(client: httpx.AsyncClient, compose_body: AceEngineBody | AceEngineBodyV2, files: dict[str, tuple[str, BinaryIO, str]], router_url: str) -> httpx.Response:
+async def send_request(client: httpx2.AsyncClient, compose_body: AceEngineBody | AceEngineBodyV2, files: dict[str, tuple[str, BinaryIO, str]], router_url: str) -> httpx2.Response:
     form_boundary = f"----WebKitFormBoundary{time.time()}"
     request = client.build_request("POST", router_url)
     headers, stream = encode_multipart_data(
@@ -323,7 +323,7 @@ async def send_request(client: httpx.AsyncClient, compose_body: AceEngineBody | 
     return await client.send(request)
 
 
-async def download_and_open_audio(client: httpx.AsyncClient, url: str) -> tuple[np.ndarray, int]:
+async def download_and_open_audio(client: httpx2.AsyncClient, url: str) -> tuple[np.ndarray, int]:
     response = await client.get(url)
     response.raise_for_status()
 
@@ -331,7 +331,7 @@ async def download_and_open_audio(client: httpx.AsyncClient, url: str) -> tuple[
         data, samplerate = sf.read(file)
         return data, samplerate
 
-async def one_piece_compose(client: httpx.AsyncClient, ace_token: str, aces: dict, router_url: str, router_version: int) -> tuple[float, np.ndarray, int]:
+async def one_piece_compose(client: httpx2.AsyncClient, ace_token: str, aces: dict, router_url: str, router_version: int) -> tuple[float, np.ndarray, int]:
     user_config = read_ace_user_info_config()
     user_id = json.loads(
         json.loads(user_config.get("user_info_group", "user_info_key"))
@@ -373,7 +373,7 @@ async def one_piece_compose(client: httpx.AsyncClient, ace_token: str, aces: dic
 
     return pst, audio_data, samplerate
 
-async def rendering_ace_list(client: httpx.AsyncClient, ace_list: list[AcesItem], save_to_path: pathlib.Path, as_token: str, router_id: int) -> None:
+async def rendering_ace_list(client: httpx2.AsyncClient, ace_list: list[AcesItem], save_to_path: pathlib.Path, as_token: str, router_id: int) -> None:
     vocal_offset = None
     concat_audio = []
 
@@ -410,7 +410,7 @@ async def rendering_ace_list(client: httpx.AsyncClient, ace_list: list[AcesItem]
     logger.info(explanation)
 
 
-async def download_phoneme_data(client: httpx.AsyncClient) -> dict[str, Any]:
+async def download_phoneme_data(client: httpx2.AsyncClient) -> dict[str, Any]:
     config_resp = await client.get(
         urljoin(ACE_API_BASE_URL, "/api/as/conf/client"),
     )
@@ -436,7 +436,7 @@ def start_trial() -> None:
     user_info_config = read_ace_user_info_config()
     uid = str(json.loads(json.loads(user_info_config["user_info_group"]["user_info_key"]))["uid"])
     app_headers = default_headers()
-    client = httpx.Client(
+    client = httpx2.Client(
         follow_redirects=True,
         timeout=10,
         headers=app_headers,
@@ -481,12 +481,12 @@ def start_trial() -> None:
 
 
 
-async def pre_login() -> httpx.AsyncClient | None:
+async def pre_login() -> httpx2.AsyncClient | None:
     config_parser = read_ace_login_config()
     token = json.loads(
         json.loads(config_parser["login_token_group"]["login_token_key"])
     )["token"]
-    client = httpx.AsyncClient(
+    client = httpx2.AsyncClient(
         follow_redirects=True,
         timeout=10,
         headers=default_headers(token),
@@ -516,7 +516,7 @@ async def pre_login() -> httpx.AsyncClient | None:
     return client
 
 
-async def fetch_as_token(client: httpx.AsyncClient) -> str:
+async def fetch_as_token(client: httpx2.AsyncClient) -> str:
     as_token_response = await client.get(
         urljoin(
             ACE_API_BASE_URL,
@@ -533,7 +533,7 @@ async def fetch_as_token(client: httpx.AsyncClient) -> str:
 @app.command()
 def login(phone_number: str) -> None:
     is_email = "@" in phone_number
-    client = httpx.Client(follow_redirects=True, timeout=10, headers=default_headers())
+    client = httpx2.Client(follow_redirects=True, timeout=10, headers=default_headers())
     typer.echo(f"Login using {phone_number}")
     if is_email:
         response = client.post(
@@ -615,7 +615,7 @@ def login(phone_number: str) -> None:
             write_ace_user_info_config(user_info_config)
 
 
-async def fetch_singers(client: httpx.AsyncClient | None = None) -> None:
+async def fetch_singers(client: httpx2.AsyncClient | None = None) -> None:
     if client is None:
         client = await pre_login()
     if client is None:

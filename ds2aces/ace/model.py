@@ -69,8 +69,9 @@ class AceEngineBodyV2(BaseModel):
     response_type: str
     context_id: str
     mix_info: str
-    inpainting_time_list: list[AceSimpleSegment] = Field(default_factory=list)
-    delete_time_list: list[AceSimpleSegment] = Field(default_factory=list)
+    inpainting_time_list: str = "[]"
+    delete_time_list: str = "[]"
+    version: str = "V2"
 
 
 class AceParam(BaseModel):
