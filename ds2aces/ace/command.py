@@ -365,7 +365,7 @@ async def one_piece_compose(client: httpx2.AsyncClient, ace_token: str, aces: di
     compose_resp = await send_request(
         client, compose_body, files, router_url
     )
-    logger.debug(compose_resp.json())
+    # logger.debug(compose_resp.json())
     result = compose_resp.json()["data"][0]
     audio_url = result.get('audio')
     audio_data, samplerate = await download_and_open_audio(client, audio_url)
@@ -802,8 +802,11 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                                 vowel_dur = ds_item.ph_dur[ph_index]
                                 consonant_time_head.append(vowel_dur)
                                 silence_time_start = cur_time - vowel_dur
-                                for pitch_param in pitch_params:
-                                    pitch_param.silent(silence_time_start, cur_time)
+                                pitch_params = [
+                                    seg
+                                    for pp in pitch_params
+                                    for seg in pp.silent(silence_time_start, cur_time)
+                                ]
                             ph_index += 1
                             phoneme_buf.append(phone)
                             if len(phoneme_buf) == 1 and phone not in vowels_set:
