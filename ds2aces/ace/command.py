@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import asyncio
+import concurrent.futures
+import contextlib
 import hashlib
 import hmac
 import io
@@ -10,8 +13,10 @@ import math
 import os
 import pathlib
 import re
+import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from urllib.parse import urljoin
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypeAlias
 
@@ -60,11 +65,125 @@ from ds2aces.utils.music_math import hz2midi, note2midi
 if TYPE_CHECKING:
     import numpy as np
 
+with contextlib.suppress(ImportError, OSError):
+    from timsdk.manager import TIMManager
+
+if "TIMManager" not in globals():
+    TIMManager = None
+
 app = typer.Typer()
 
 CENTS_RE = re.compile(r"[+-]\d+$")
 AcesItem: TypeAlias = dict[str, Any]
 AcesNoteItem: TypeAlias = dict[str, Any]
+
+
+@dataclass
+class TranscriptionTimListener:
+    request_id: str
+    song_hash: str
+    fallback_url: str
+    download_dir: pathlib.Path
+    client: httpx2.AsyncClient
+    loop: asyncio.AbstractEventLoop
+    result_event: threading.Event = field(default_factory=threading.Event)
+    result_url: str | None = None
+    downloaded_path: pathlib.Path | None = None
+    matched_message: dict[str, Any] | None = None
+    download_future: concurrent.futures.Future[pathlib.Path] | None = None
+
+    def handle_log(self, level: int, message: str, metadata: dict[str, Any]) -> None:
+        return None
+
+    def handle_login(
+        self, code: int, desc: str, json_param: str, metadata: dict[str, Any]
+    ) -> None:
+        return None
+
+    def handle_messages(self, msgs: list[dict[str, Any]], metadata: dict[str, Any]) -> None:
+        for msg in msgs:
+            if self.result_event.is_set():
+                return
+            logger.debug(f"Received TIM message: {msg}")
+            if result_url := _find_matching_transcription_url(
+                msg, self.request_id, self.song_hash
+            ):
+                self.result_url = result_url
+                self.matched_message = msg
+                self.result_event.set()
+                logger.info("Received transcription result through TIM")
+                logger.info(result_url)
+                self.download_future = asyncio.run_coroutine_threadsafe(
+                    self.download_result(result_url), self.loop
+                )
+                return
+
+    async def download_result(self, result_url: str) -> pathlib.Path:
+        target_path = self.download_dir / f"{self.song_hash}.ace"
+        response = await self.client.get(result_url)
+        response.raise_for_status()
+        target_path.write_bytes(response.content)
+        self.downloaded_path = target_path
+        logger.info(f"Downloaded transcription to {target_path}")
+        return target_path
+
+
+def _decode_nested_json(value: Any) -> Any:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped[:1] in {"{", "["}:
+            with contextlib.suppress(json.JSONDecodeError):
+                return _decode_nested_json(json.loads(stripped))
+    if isinstance(value, list):
+        return [_decode_nested_json(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _decode_nested_json(item) for key, item in value.items()}
+    return value
+
+
+def _iter_nested_values(value: Any):
+    decoded = _decode_nested_json(value)
+    yield decoded
+    if isinstance(decoded, dict):
+        for item in decoded.values():
+            yield from _iter_nested_values(item)
+    elif isinstance(decoded, list):
+        for item in decoded:
+            yield from _iter_nested_values(item)
+
+
+def _extract_urls(value: Any) -> list[str]:
+    urls: list[str] = []
+    for item in _iter_nested_values(value):
+        if isinstance(item, dict):
+            for key in ("file_url", "fileUrl", "url", "download_url", "downloadUrl"):
+                url = item.get(key)
+                if isinstance(url, str) and url.startswith("http"):
+                    urls.append(url)
+        elif isinstance(item, str) and item.startswith("http"):
+            urls.append(item)
+    return urls
+
+
+def _message_matches_request(value: Any, request_id: str, song_hash: str) -> bool:
+    for item in _iter_nested_values(value):
+        if isinstance(item, dict):
+            for key in ("request_id", "requestId", "task_id", "taskId"):
+                if item.get(key) == request_id:
+                    return True
+        elif isinstance(item, str) and (request_id in item or song_hash in item):
+            return True
+    return False
+
+
+def _find_matching_transcription_url(
+    message: dict[str, Any], request_id: str, song_hash: str
+) -> str | None:
+    if not _message_matches_request(message, request_id, song_hash):
+        return None
+    for url in _extract_urls(message):
+        return url
+    return None
 
 def cut_aces(aces: AcesItem) -> list[AcesItem]:
     version = aces["version"]
@@ -913,35 +1032,95 @@ async def transcribe_asynchronous(
         if upload_result.status != 200:
             raise ValueError("Upload failed")
 
-    extra_kwargs = {
-        "format": "json"
-    } if version == "2.0" else {}
-    resp = await client.post(
-        vt_api_url,
-        json={
-            "app": "studio",
-            "audio": f"https://as-api.oss-accelerate.aliyuncs.com/{upload_prefix}/{song_hash}.ogg",
-            "request_id": f"{user_id}_{version}_{language}_{song_hash}",
-            "to_lan": language,
-            "version": version,
-            **extra_kwargs,
-        },
-        headers={
-            "token": vt_api_token,
-        },
+    tim_listener: TranscriptionTimListener | None = None
+    tim_manager = None
+    request_id = f"{user_id}_{version}_{language}_{song_hash}"
+    fallback_language = "zh" if language == "ch" else language
+    fallback_url = (
+        f"https://as-api.oss-cn-qingdao.aliyuncs.com/app/user/vt/file/"
+        f"{fallback_language}/{song_hash}.ace"
     )
-    resp_data = resp.json()
-    if resp_data["data"].get("file_url"):
-        logger.info("Transcription success")
-        logger.info(resp_data["data"]["file_url"])
-    else:
-        # TODO: add integration with https://github.com/SoulMelody/python-timsdk
-        logger.info("Please wait for the transcription result")
-        if language == "ch":
-            language = "zh"
-        logger.info(
-            f"https://as-api.oss-cn-qingdao.aliyuncs.com/app/user/vt/file/{language}/{song_hash}.ace"
+    if TIMManager is not None:
+        try:
+            im_sign_resp = await client.get(
+                urljoin(ACE_API_BASE_URL, "/api/as/im/sign")
+            )
+            im_sign_data = im_sign_resp.json().get("data", {})
+            sdk_appid = int(im_sign_data["app_id"])
+            user_sig = im_sign_data["sign"]
+            tim_listener = TranscriptionTimListener(
+                request_id=request_id,
+                song_hash=song_hash,
+                fallback_url=fallback_url,
+                download_dir=song_path.parent,
+                client=client,
+                loop=asyncio.get_running_loop(),
+            )
+            tim_manager = TIMManager(
+                sdk_appid=sdk_appid,
+                user_id=str(user_id),
+                user_sig=user_sig,
+                metadata={"request_id": request_id, "song_hash": song_hash},
+                message_handler=tim_listener.handle_messages,
+                login_handler=tim_listener.handle_login,
+                log_handler=tim_listener.handle_log,
+            )
+            tim_manager.start()
+        except Exception:
+            logger.debug("TIM integration is unavailable for this transcription request")
+
+    try:
+        extra_kwargs = {
+            "format": "json"
+        } if version == "2.0" else {}
+        resp = await client.post(
+            vt_api_url,
+            json={
+                "app": "studio",
+                "audio": f"https://as-api.oss-accelerate.aliyuncs.com/{upload_prefix}/{song_hash}.ogg",
+                "request_id": request_id,
+                "to_lan": language,
+                "version": version,
+                **extra_kwargs,
+            },
+            headers={
+                "token": vt_api_token,
+            },
         )
+        resp_data = resp.json()
+        if resp_data["data"].get("file_url"):
+            logger.info("Transcription success")
+            await (tim_listener.download_result(resp_data["data"]["file_url"]) if tim_listener is not None else _download_file(client, resp_data["data"]["file_url"], song_path.parent / f"{song_hash}.ace"))
+        else:
+            logger.info("Please wait for the transcription result")
+            if tim_listener is not None:
+                if await anyio.to_thread.run_sync(tim_listener.result_event.wait, 180):
+                    if tim_listener.download_future is not None:
+                        await anyio.to_thread.run_sync(
+                            tim_listener.download_future.result, 180
+                        )
+                    elif tim_listener.result_url and tim_listener.downloaded_path is None:
+                        await tim_listener.download_result(tim_listener.result_url)
+                else:
+                    logger.info(tim_listener.fallback_url)
+            else:
+                logger.info(fallback_url)
+    finally:
+        if tim_manager is not None:
+            tim_manager.stop()
+            tim_manager.join(timeout=15)
+            if tim_manager.is_alive():
+                logger.warning("TIM manager did not stop cleanly before process exit")
+
+
+async def _download_file(
+    client: httpx2.AsyncClient, url: str, target_path: pathlib.Path
+) -> pathlib.Path:
+    response = await client.get(url)
+    response.raise_for_status()
+    target_path.write_bytes(response.content)
+    logger.info(f"Downloaded transcription to {target_path}")
+    return target_path
 
 
 @app.command()

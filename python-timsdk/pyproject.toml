@@ -1,0 +1,35 @@
+[project]
+name = "timsdk"
+authors = [{ name = "SoulMelody", email = "yjxrtzyx@gmail.com" }]
+readme = "README.md"
+license = { file = "LICENSE" }
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+]
+requires-python = ">=3.10"
+version = "0.0.1"
+description = "Tencent Instant Messaging SDK for Python"
+dependencies = ["loguru >= 0.7.3"]
+
+[project.scripts]
+post-setup = "timsdk.post_install:main"
+
+[project.urls]
+Home = "https://github.com/SoulMelody/python-timsdk"
+
+[dependency-groups]
+dev = [
+    "nodeenv>=1.10.0",
+]
+
+[tool.uv.build-backend]
+module-name = "timsdk"
+module-root = ""
+
+[build-system]
+requires = ["uv_build"]
+build-backend = "uv_build"

@@ -201,7 +201,7 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
+# timsdk
+python-timsdk/timsdk/com_tencent_imsdk_data/
+python-timsdk/timsdk/com_tencent_imsdk_log/
+python-timsdk/node_modules/

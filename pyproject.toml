@@ -20,11 +20,33 @@ dependencies = [
     "pypinyin>=0.55.0",
     "rich>=15.0.0",
     "tenacity>=9.1.4",
+    "timsdk; sys_platform == \"win32\" or sys_platform == \"linux\" or sys_platform == \"darwin\"",
     "typer>=0.25.1",
     "wanakana-python>=1.2.2",
 ]
+
+[project.scripts]
+post-setup-workspace = "ds2aces.setup:setup_workspace"
+post-setup-timsdk = "ds2aces.setup:setup_timsdk"
 
 [dependency-groups]
 dev = [
     "pydub-stubs>=0.25.1.6",
 ]
+
+[tool.uv]
+package = true
+
+[tool.uv.workspace]
+members = ["python-timsdk"]
+
+[tool.uv.sources]
+timsdk = { workspace = true }
+
+[tool.uv.build-backend]
+module-name = "ds2aces"
+module-root = ""
+
+[build-system]
+requires = ["uv_build"]
+build-backend = "uv_build"
