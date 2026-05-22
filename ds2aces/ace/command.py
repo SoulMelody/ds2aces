@@ -535,11 +535,12 @@ async def download_phoneme_data(client: httpx2.AsyncClient) -> dict[str, Any]:
     )
     config_resp.raise_for_status()
     config_data = config_resp.json()
-    multi_lan_plan_url = config_data["data"]["multi_lan_plan"]["url"]
-    multi_lan_plan_path = ACE_CONFIG_ROOT / "ClientSetup" / os.path.basename(multi_lan_plan_url)
+    multi_lan_plan_data = config_data["data"]["multi_lan_plan"]
+    multi_lan_plan_url_hash = hashlib.md5((multi_lan_plan_data["url"] + f'{multi_lan_plan_data["version"]:g}').encode()).hexdigest()
+    multi_lan_plan_path = ACE_CONFIG_ROOT / "ClientSetUp" / f'{multi_lan_plan_url_hash}{pathlib.Path(multi_lan_plan_data["url"]).suffix}'
     if not multi_lan_plan_path.exists():
         with multi_lan_plan_path.open("wb") as f:
-            async with client.stream("GET", multi_lan_plan_url) as stream:
+            async with client.stream("GET", multi_lan_plan_data["url"]) as stream:
                 async for chunk in stream.aiter_bytes():
                     f.write(chunk)
     return json.loads(
