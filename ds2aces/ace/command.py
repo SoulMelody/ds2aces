@@ -58,6 +58,7 @@ from ds2aces.ace.model import (
     AcesProject,
     compress_ace_segment,
 )
+from ds2aces.ace.latin_g2p import MLG2PService
 from ds2aces.ds.ds_file import DsProject
 from ds2aces.ds.phoneme_dict import get_ds_phone_dict, get_vowels_set
 from ds2aces.utils.music_math import hz2midi, note2midi
@@ -76,6 +77,40 @@ app = typer.Typer()
 CENTS_RE = re.compile(r"[+-]\d+$")
 AcesItem: TypeAlias = dict[str, Any]
 AcesNoteItem: TypeAlias = dict[str, Any]
+LATIN_G2P_LANGUAGES = {"en", "spa", "fr", "it", "pt"}
+LATIN_G2P_LANGUAGE_MAP = {"en": "en", "spa": "es", "fr": "fr", "it": "it", "pt": "pt"}
+ACE_PLAN_LANGUAGE_MAP = {
+    "ch": "zh",
+    "jp": "jp",
+    "ko": "ko",
+    "en": "eng",
+    "spa": "spa",
+    "fr": "fr",
+    "it": "it",
+    "pt": "pt",
+}
+_LATIN_G2P_SERVICE: MLG2PService | None = None
+
+
+def get_latin_g2p_service() -> MLG2PService:
+    global _LATIN_G2P_SERVICE
+    if _LATIN_G2P_SERVICE is None:
+        model_dir = pathlib.Path(__file__).resolve().parents[1] / "assets"
+        _LATIN_G2P_SERVICE = MLG2PService(model_dir)
+    return _LATIN_G2P_SERVICE
+
+
+def get_ace_phone_plan(ace_phone_dict: dict[str, Any], language: str) -> dict[str, Any]:
+    ace_language = ACE_PLAN_LANGUAGE_MAP[language]
+    for plan in ace_phone_dict["plans"]:
+        if plan.get("language") == ace_language:
+            return plan
+    raise ValueError(f"Cannot find ACE phoneme plan for language {language!r}")
+
+
+def get_ace_vowels_set(ace_phone_plan: dict[str, Any]) -> set[str]:
+    phon_class = ace_phone_plan.get("phon_class", {})
+    return set(phon_class.get("tail", []))
 
 
 @dataclass
@@ -778,11 +813,20 @@ def g2p(lyric: str, language: Literal["ch", "en", "jp", "spa", "ko", "pt", "fr",
         return " ".join(pypinyin.lazy_pinyin(lyric, style=pypinyin.Style.NORMAL))
     elif language == "jp":
         return wanakana.to_romaji(lyric, custom_romaji_mapping={"っ": "cl"})
+    elif language in LATIN_G2P_LANGUAGES:
+        latin_language = LATIN_G2P_LANGUAGE_MAP[language]
+        return " ".join(get_latin_g2p_service().predict(latin_language, lyric))
     else:
         raise NotImplementedError(f"Language {language} is not supported yet")
 
 
-async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: bool = False, render: bool = False, language: Literal["ch", "en", "jp", "spa"] = "ch") -> None:
+async def ds_to_aces(
+    in_path: pathlib.Path,
+    output_dir: pathlib.Path,
+    param: bool = False,
+    render: bool = False,
+    language: Literal["ch", "en", "jp", "spa", "ko", "pt", "fr", "it"] = "ch",
+) -> None:
     client = await pre_login()
     if not client:
         logger.error("login failed")
@@ -791,11 +835,15 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
     if language == "ch":
         ds_phone_dict = get_ds_phone_dict("opencpop-extension", g2p=False)
         vowels_set = get_vowels_set("opencpop-extension")
-        ace_phone_dict = ACE_PHONE_DICT["plans"][0]
+        ace_phone_dict = get_ace_phone_plan(ACE_PHONE_DICT, language)
     elif language == "jp":
         ds_phone_dict = get_ds_phone_dict("japanese_dict_full", g2p=False)
         vowels_set = get_vowels_set("japanese_dict_full")
-        ace_phone_dict = ACE_PHONE_DICT["plans"][1]
+        ace_phone_dict = get_ace_phone_plan(ACE_PHONE_DICT, language)
+    elif language in LATIN_G2P_LANGUAGES:
+        ds_phone_dict = {}
+        ace_phone_dict = get_ace_phone_plan(ACE_PHONE_DICT, language)
+        vowels_set = get_ace_vowels_set(ace_phone_dict)
     else:
         raise NotImplementedError(f"Language {language} is not supported yet")
     ds_project = DsProject.model_validate_json(in_path.read_text(encoding="utf-8"))
@@ -884,9 +932,13 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                                     pronunciation = ds_phone_dict[ds_phone]
                                 else:
                                     pronunciation = g2p(text, language)
-                            if pronunciation in ace_phone_dict["syllable_alias"]:
-                                pronunciation = ace_phone_dict["syllable_alias"][pronunciation]
-                            if language != "ch" and pronunciation in ace_phone_dict["dict"]:
+                            syllable_alias = ace_phone_dict.get("syllable_alias", {})
+                            if pronunciation in syllable_alias:
+                                pronunciation = syllable_alias[pronunciation]
+                            if language in LATIN_G2P_LANGUAGES:
+                                phone = pronunciation.split()
+                                pronunciation = text
+                            elif language != "ch" and pronunciation in ace_phone_dict["dict"]:
                                 phone = ace_phone_dict["dict"][pronunciation]
                             else:
                                 phone = []
@@ -941,9 +993,13 @@ async def ds_to_aces(in_path: pathlib.Path, output_dir: pathlib.Path, param: boo
                             pronunciation = ds_phone_dict[ds_phone]
                         else:
                             pronunciation = g2p(text, language)
-                    if pronunciation in ace_phone_dict["syllable_alias"]:
-                        pronunciation = ace_phone_dict["syllable_alias"][pronunciation]
-                    if language != "ch" and pronunciation in ace_phone_dict["dict"]:
+                    syllable_alias = ace_phone_dict.get("syllable_alias", {})
+                    if pronunciation in syllable_alias:
+                        pronunciation = syllable_alias[pronunciation]
+                    if language in LATIN_G2P_LANGUAGES:
+                        phone = pronunciation.split()
+                        pronunciation = text
+                    elif language != "ch" and pronunciation in ace_phone_dict["dict"]:
                         phone = ace_phone_dict["dict"][pronunciation]
                     else:
                         phone = []
@@ -987,8 +1043,10 @@ def ds2aces(
     render: bool = typer.Option(False),
     language: Literal["ch", "en", "jp", "spa", "ko", "pt", "fr", "it"] = "ch",
 ) -> None:
-    if language not in ["ch", "jp"]: # TODO: support other languages
-        raise NotImplementedError("Only Chinese and Japanese are supported")
+    if language not in ["ch", "en", "jp", "spa", "pt", "fr", "it"]: # TODO: support Korean
+        raise NotImplementedError(
+            "Only Chinese, Japanese, English, Spanish, Portuguese, French and Italian are supported"
+        )
     anyio.run(ds_to_aces, in_path, output_dir, param, render, language)
 
 

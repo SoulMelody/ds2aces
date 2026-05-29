@@ -145,8 +145,15 @@ class MLG2PProvider:
         if self._session is None:
             if ort is None:
                 raise RuntimeError("onnxruntime is not installed")
+            session_options = ort.SessionOptions()
+            session_options.log_severity_level = 3
+            session_options.graph_optimization_level = (
+                ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+            )
             self._session = ort.InferenceSession(
-                str(self.model_path), providers=["CPUExecutionProvider"]
+                str(self.model_path),
+                sess_options=session_options,
+                providers=["CPUExecutionProvider"],
             )
         return self._session
 

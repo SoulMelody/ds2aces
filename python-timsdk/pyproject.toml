@@ -1,8 +1,7 @@
 [project]
-name = "timsdk"
+name = "python-timsdk"
 authors = [{ name = "SoulMelody", email = "yjxrtzyx@gmail.com" }]
 readme = "README.md"
-license = { file = "LICENSE" }
 classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: MacOS",
