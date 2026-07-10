@@ -7,12 +7,12 @@ requires-python = ">=3.11,<3.15"
 dependencies = [
     "asyncio-oss>=1.1.5",
     "audioop-lts>=0.2.2; python_version >= \"3.13\"",
-    "backports.zstd>=1.5.0; python_version < \"3.14\"",
-    "httpx2>=2.2.0",
+    "backports.zstd>=1.6.0; python_version < \"3.14\"",
+    "httpx2>=2.5.0",
     "librosa>=0.11.0",
     "loguru>=0.7.3",
     "more-itertools>=11.1.0",
-    "onnxruntime>=1.26.0",
+    "onnxruntime>=1.27.0",
     "platformdirs>=4.10.0",
     "portable-ffmpeg>=0.2.0",
     "pydantic>=2.13.4",
@@ -21,7 +21,7 @@ dependencies = [
     "rich>=15.0.0",
     "tenacity>=9.1.4",
     "python-timsdk; sys_platform == \"win32\" or sys_platform == \"linux\" or sys_platform == \"darwin\"",
-    "typer>=0.26.3",
+    "typer>=0.26.8",
     "wanakana-python>=1.2.2",
 ]
 

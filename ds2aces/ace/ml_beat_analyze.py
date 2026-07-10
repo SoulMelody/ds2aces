@@ -1,6 +1,7 @@
 import functools
 import hashlib
 import json
+import math
 import os
 import pathlib
 from typing import Optional
@@ -14,20 +15,48 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 
 
-MODEL_PATH = os.path.join(os.environ["ACE_STUDIO_PATH"], "ml_beat_analyze", "new_beat_this_uint8.onnx.enc")
+MODEL_PATH = os.path.join(
+    os.environ["ACE_STUDIO_PATH"], "ml_beat_analyze", "new_beat_this_uint8.onnx.enc"
+)
 KEY_SEED = "6866820113205650261"
 IV_SEED = "11748920987862562174"
 
-SAMPLE_RATE = 22050
-HOP_LENGTH = 512
-N_FFT = 2048
-N_MELS = 128
-FMIN = 27.5
-FMAX = 8000.0
 
-CHUNK_DURATION = 30.0
-OVERLAP_DURATION = 5.0
-BEATS_PER_BAR = 4
+SAMPLE_RATE = 22050
+HOP_LENGTH = 441             # 22050 / 441 = 50.0 fps
+N_FFT = 1024
+N_MELS = 128
+FMIN = 30.0
+FMAX = 11000.0
+FRAME_RATE = SAMPLE_RATE / HOP_LENGTH  # 50.0
+
+PAD_SIZE = 512               # reflect-pad samples before STFT
+MAG_SCALE = 0.03125          # 1/32: |STFT| * MAG_SCALE -> mel filterbank
+LOG_SCALE = 1000.0           # log1p(x * LOG_SCALE)
+
+# Sliding-window ONNX inference. Matches the decompiled chunk loop:
+#   chunk_start in [-CHUNK_CONTEXT .. n-CHUNK_CONTEXT), stride = CHUNK_FRAME_STRIDE
+#   mel window fed to the model = ONNX_CHUNK_LEN frames starting at
+#   chunk_start + CHUNK_CONTEXT.
+CHUNK_FRAME_STRIDE = 1488
+CHUNK_CONTEXT = 6
+ONNX_CHUNK_LEN = 1500
+
+# DFT-based tempo detection (used for the global BPM estimate).
+DFT_TABLE_SIZE = 4096
+BPM_MIN = 60
+BPM_MAX = 240                # inclusive upper bound on the integer search
+
+# Peak detection (running-max + local-max equality).
+PEAK_RUNNING_MAX_RADIUS = 3
+
+# Adjacent-peak clustering (frames within 1 of each other).
+CLUSTER_GAP_FRAMES = 1
+
+# Postprocessing: when snapping a downbeat to a beat, accept nearest beat if
+# it is within ``mean_interval * TOLERANCE_FACTOR``; otherwise insert the
+# downbeat itself as a synthetic beat.
+DOWNBEAT_TOLERANCE_FACTOR = 0.25
 
 
 def derive_key() -> bytes:
@@ -61,783 +90,274 @@ def load_model_from_memory(encrypted_path: str = MODEL_PATH) -> ort.InferenceSes
     return session
 
 
-def _compute_mel(audio: np.ndarray, sr: int) -> np.ndarray:
-    mel = librosa.feature.melspectrogram(
-        y=audio, sr=sr, n_fft=N_FFT, hop_length=HOP_LENGTH,
-        n_mels=N_MELS, fmin=FMIN, fmax=FMAX,
-    )
-    mel_db = librosa.power_to_db(mel, ref=np.max)
-    return mel_db.T.astype(np.float32)
+# --- Mel-spectrogram stage --------------------------------------------------
 
 
-def _detect_peaks(
-    activation: np.ndarray,
-    hop_length: int,
-    sr: int,
-    min_bpm: float = 40.0,
-    max_bpm: float = 300.0,
-) -> np.ndarray:
-    min_distance_sec = 60.0 / max_bpm
-    min_distance = max(1, int(min_distance_sec * sr / hop_length))
+def _compute_mel(audio: np.ndarray) -> np.ndarray:
+    """Match the decompiled mel pipeline:
 
-    threshold = np.mean(activation) + 0.3 * np.std(activation)
+        reflect-pad by PAD_SIZE -> |STFT(center=False)| * MAG_SCALE ->
+        mel @ mag -> log1p(x * LOG_SCALE) -> drop PAD_SIZE//HOP_LENGTH frames.
+    """
+    padded = np.pad(audio, PAD_SIZE, mode="reflect")
 
-    peaks = []
-    for i in range(1, len(activation) - 1):
-        if activation[i] <= threshold:
-            continue
-        if activation[i] <= activation[i - 1] or activation[i] <= activation[i + 1]:
-            continue
-        if peaks and i - peaks[-1] < min_distance:
-            if activation[i] > activation[peaks[-1]]:
-                peaks[-1] = i
-            continue
-        peaks.append(i)
-
-    peak_positions = []
-    for peak in peaks:
-        left = activation[peak - 1]
-        center = activation[peak]
-        right = activation[peak + 1]
-        denominator = left - 2.0 * center + right
-        if denominator < 0:
-            offset = 0.5 * (left - right) / denominator
-            offset = float(np.clip(offset, -0.5, 0.5))
-        else:
-            offset = 0.0
-        peak_positions.append(peak + offset)
-
-    return np.array(peak_positions, dtype=np.float64) * hop_length / sr
-
-
-def _estimate_bpm_from_activation(
-    activation: np.ndarray,
-    hop_length: int,
-    sr: int,
-    min_bpm: float,
-    max_bpm: float,
-    candidate_bpms: Optional[np.ndarray] = None,
-    preferred_min_bpm: float = 80.0,
-    preferred_max_bpm: float = 180.0,
-) -> float:
-    x = np.asarray(activation, dtype=np.float64)
-    if len(x) < 4:
-        return 0.0
-
-    x = np.nan_to_num(x, copy=False)
-    x = x - np.percentile(x, 70)
-    x[x < 0] = 0.0
-    peak = np.max(x)
-    if peak <= 0:
-        return 0.0
-    x /= peak
-
-    frame_positions = np.arange(len(x), dtype=np.float64)
-
-    def score_bpm(bpm: float, phase_step: float) -> float:
-        if bpm <= 0:
-            return 0.0
-
-        period = sr * 60.0 / (hop_length * bpm)
-        if period <= 0:
-            return 0.0
-
-        best_score = 0.0
-        for phase in np.arange(0.0, period, phase_step):
-            points = np.arange(phase, len(x), period)
-            if len(points) < 8:
-                continue
-            values = np.interp(points, frame_positions, x)
-            values = np.sort(values)[int(len(values) * 0.3) :]
-            score = float(np.mean(values))
-            if score > best_score:
-                best_score = score
-        return best_score
-
-    search_bpms: list[float] = []
-    if candidate_bpms is not None and len(candidate_bpms) > 0:
-        for candidate in candidate_bpms:
-            aliases = [candidate]
-            if candidate < preferred_min_bpm:
-                aliases.append(candidate * 2.0)
-            if candidate > preferred_max_bpm:
-                aliases.append(candidate / 2.0)
-            for alias in aliases:
-                if min_bpm <= alias <= max_bpm:
-                    search_bpms.extend(np.arange(max(min_bpm, alias - 6.0), min(max_bpm, alias + 6.0) + 0.001, 0.5))
-    else:
-        search_bpms.extend(np.arange(min_bpm, max_bpm + 0.001, 1.0))
-
-    coarse: list[tuple[float, float]] = []
-    for bpm in sorted(set(round(float(bpm), 4) for bpm in search_bpms)):
-        coarse.append((score_bpm(float(bpm), phase_step=1.0), float(bpm)))
-    if len(coarse) == 0:
-        return 0.0
-
-    coarse.sort(reverse=True)
-    refined: list[tuple[float, float]] = []
-    for _, coarse_bpm in coarse[:8]:
-        fine_min = max(min_bpm, coarse_bpm - 2.0)
-        fine_max = min(max_bpm, coarse_bpm + 2.0)
-        for bpm in np.arange(fine_min, fine_max + 0.001, 0.05):
-            refined.append((score_bpm(float(bpm), phase_step=0.5), float(bpm)))
-    if len(refined) == 0:
-        return 0.0
-
-    score, bpm = max(refined)
-    while bpm < preferred_min_bpm and bpm * 2.0 <= max_bpm:
-        doubled_score = score_bpm(bpm * 2.0, phase_step=0.5)
-        if doubled_score < score * 0.75:
-            break
-        bpm *= 2.0
-        score = doubled_score
-
-    while bpm > preferred_max_bpm and bpm / 2.0 >= min_bpm:
-        halved_score = score_bpm(bpm / 2.0, phase_step=0.5)
-        if halved_score < score * 0.75:
-            break
-        bpm /= 2.0
-        score = halved_score
-
-    return float(bpm)
-
-
-def _prepare_activation_context(activation: np.ndarray) -> Optional[tuple[np.ndarray, np.ndarray]]:
-    x = np.asarray(activation, dtype=np.float64)
-    if len(x) < 4:
-        return None
-
-    x = np.nan_to_num(x, copy=False)
-    x = x - np.percentile(x, 70)
-    x[x < 0] = 0.0
-    peak = np.max(x)
-    if peak <= 0:
-        return None
-    x /= peak
-
-    frame_positions = np.arange(len(x), dtype=np.float64)
-    return x, frame_positions
-
-
-def _score_activation_context(
-    context: Optional[tuple[np.ndarray, np.ndarray]],
-    bpm: float,
-    hop_length: int = HOP_LENGTH,
-    sr: int = SAMPLE_RATE,
-    phase_step: float = 0.5,
-    score_cache: Optional[dict[tuple[float, float], float]] = None,
-) -> float:
-    if context is None or bpm <= 0:
-        return 0.0
-
-    cache_key = (round(float(bpm), 6), phase_step)
-    if score_cache is not None and cache_key in score_cache:
-        return score_cache[cache_key]
-
-    x, frame_positions = context
-    period = sr * 60.0 / (hop_length * bpm)
-    if period <= 0:
-        return 0.0
-
-    best_score = 0.0
-    trim = 0
-    for phase in np.arange(0.0, period, phase_step):
-        points = np.arange(phase, len(x), period)
-        if len(points) < 8:
-            continue
-        values = np.interp(points, frame_positions, x)
-        trim = int(len(values) * 0.3)
-        if trim > 0:
-            values = np.partition(values, trim)[trim:]
-        score = float(np.mean(values))
-        if score > best_score:
-            best_score = score
-
-    if score_cache is not None:
-        score_cache[cache_key] = best_score
-    return best_score
-
-
-def _score_bpm_on_activation(
-    activation: np.ndarray,
-    bpm: float,
-    hop_length: int = HOP_LENGTH,
-    sr: int = SAMPLE_RATE,
-    phase_step: float = 0.5,
-    context: Optional[tuple[np.ndarray, np.ndarray]] = None,
-    score_cache: Optional[dict[tuple[float, float], float]] = None,
-) -> float:
-    if context is None:
-        context = _prepare_activation_context(activation)
-    return _score_activation_context(
-        context,
-        bpm,
-        hop_length=hop_length,
-        sr=sr,
-        phase_step=phase_step,
-        score_cache=score_cache,
-    )
-
-
-def _score_bpm_on_grid(
-    beat_times: np.ndarray,
-    bpm: float,
-    hop_length: int = HOP_LENGTH,
-    sr: int = SAMPLE_RATE,
-) -> float:
-    if len(beat_times) < 2 or bpm <= 0:
-        return 0.0
-
-    interval = 60.0 / bpm
-    if interval <= 0:
-        return 0.0
-
-    tolerance = max(interval * 0.18, hop_length / sr * 1.5)
-    phase_candidates = np.linspace(0.0, interval, 64, endpoint=False)
-    best_score = 0.0
-    total_slots = max(1, int(np.rint((beat_times[-1] - beat_times[0]) / interval)) + 1)
-
-    for phase in phase_candidates:
-        indices = np.rint((beat_times - phase) / interval)
-        grid = phase + indices * interval
-        errors = np.abs(beat_times - grid)
-        hit_rate = float(np.mean(errors <= tolerance))
-        occupancy = len(np.unique(indices)) / total_slots
-        mean_error = float(np.mean(np.minimum(errors, tolerance)))
-        score = hit_rate * 0.7 + occupancy * 0.2 - (mean_error / interval) * 0.4
-        if score > best_score:
-            best_score = score
-
-    return best_score
-
-
-def _select_supported_bpm(
-    candidates: list[tuple[float, float]],
-    beat_times: np.ndarray,
-    beat_activation: np.ndarray,
-    hop_length: int = HOP_LENGTH,
-    sr: int = SAMPLE_RATE,
-    preferred_min_bpm: float = 60.0,
-    preferred_max_bpm: float = 190.0,
-    activation_context: Optional[tuple[np.ndarray, np.ndarray]] = None,
-    activation_score_cache: Optional[dict[tuple[float, float], float]] = None,
-) -> float:
-    if len(candidates) == 0:
-        return 0.0
-
-    normalized: list[tuple[float, float]] = []
-    for bpm, weight in candidates:
-        mapped = float(bpm)
-        while mapped < preferred_min_bpm and mapped * 2.0 <= preferred_max_bpm:
-            mapped *= 2.0
-        while mapped > preferred_max_bpm and mapped / 2.0 >= preferred_min_bpm:
-            mapped /= 2.0
-        normalized.append((mapped, float(weight)))
-
-    if len(normalized) == 0:
-        normalized = [(float(bpm), float(weight)) for bpm, weight in candidates]
-
-    global_grid_score_cache: dict[float, float] = {}
-
-    def base_score(bpm: float) -> float:
-        bpm_key = round(float(bpm), 6)
-        activation_score = _score_bpm_on_activation(
-            beat_activation,
-            float(bpm),
-            hop_length=hop_length,
-            sr=sr,
-            context=activation_context,
-            score_cache=activation_score_cache,
+    spec = np.abs(
+        librosa.stft(
+            padded, n_fft=N_FFT, hop_length=HOP_LENGTH, center=False
         )
-        grid_score = global_grid_score_cache.get(bpm_key)
-        if grid_score is None:
-            grid_score = _score_bpm_on_grid(beat_times, float(bpm), hop_length=hop_length, sr=sr)
-            global_grid_score_cache[bpm_key] = grid_score
-        return grid_score * 0.6 + activation_score * 0.4
+    )
+    spec = spec * MAG_SCALE
 
-    def combined_score(bpm: float, support: float) -> float:
-        return base_score(bpm) + support * 0.01
+    mel_fb = librosa.filters.mel(
+        sr=SAMPLE_RATE, n_fft=N_FFT, n_mels=N_MELS, fmin=FMIN, fmax=FMAX,
+    )
+    mel = mel_fb @ spec
 
-    normalized.sort(key=lambda item: item[0])
-    clusters: list[list[tuple[float, float]]] = []
-    for bpm, weight in normalized:
-        if len(clusters) == 0 or abs(bpm - clusters[-1][-1][0]) > 4.0:
-            clusters.append([(bpm, weight)])
+    compressed = np.log1p(mel * LOG_SCALE).astype(np.float32)
+
+    start_frame = PAD_SIZE // HOP_LENGTH
+    return compressed.T[start_frame:]
+
+
+# --- Peak detection (matches the decompiled running-max path) --------------
+
+
+def _running_max(activation: np.ndarray, radius: int = PEAK_RUNNING_MAX_RADIUS) -> np.ndarray:
+    n = len(activation)
+    if n == 0:
+        return activation.copy()
+    result = np.empty(n, dtype=np.float32)
+    for i in range(n):
+        lo = max(0, i - radius)
+        hi = min(n - 1, i + radius)
+        result[i] = float(np.max(activation[lo:hi + 1]))
+    return result
+
+
+def _detect_peaks(activation: np.ndarray) -> np.ndarray:
+    """Local-max peaks: strictly greater than zero and equal to the running max
+    over a radius-``PEAK_RUNNING_MAX_RADIUS`` window."""
+    act = np.asarray(activation, dtype=np.float32)
+    if len(act) < 2:
+        return np.array([], dtype=np.int64)
+
+    local_max = _running_max(act, radius=PEAK_RUNNING_MAX_RADIUS)
+    mask = (act > 0.0) & (act == local_max)
+    return np.nonzero(mask)[0].astype(np.int64)
+
+
+def _cluster_adjacent_peaks(frame_indices: np.ndarray) -> np.ndarray:
+    """Average frames whose neighbours differ by at most ``CLUSTER_GAP_FRAMES``."""
+    if len(frame_indices) < 2:
+        return frame_indices.copy().astype(np.float64)
+
+    groups: list[list[int]] = []
+    current: list[int] = [int(frame_indices[0])]
+    for i in range(1, len(frame_indices)):
+        cur = int(frame_indices[i])
+        if cur - int(frame_indices[i - 1]) <= CLUSTER_GAP_FRAMES:
+            current.append(cur)
         else:
-            clusters[-1].append((bpm, weight))
+            groups.append(current)
+            current = [cur]
+    groups.append(current)
 
-    cluster_centers: list[tuple[float, float]] = []
-    for cluster in clusters:
-        bpms = np.array([bpm for bpm, _ in cluster], dtype=np.float64)
-        weights = np.array([weight for _, weight in cluster], dtype=np.float64)
-        center = float(np.average(bpms, weights=weights))
-        support = float(np.sum(weights))
-        cluster_centers.append((center, support))
+    return np.array([float(np.mean(g)) for g in groups], dtype=np.float64)
 
-    ranked: list[tuple[float, float, list[tuple[float, float]]]] = []
-    for cluster, (center, support) in zip(clusters, cluster_centers):
-        cluster_best_bpm = 0.0
-        cluster_best_score = -np.inf
-        coarse_min = max(40.0, center - 4.0)
-        coarse_max = min(300.0, center + 4.0)
-        coarse_scores: list[tuple[float, float]] = []
-        for bpm in np.arange(coarse_min, coarse_max + 0.001, 0.25):
-            score = combined_score(float(bpm), support)
-            coarse_scores.append((score, float(bpm)))
-            if score > cluster_best_score:
-                cluster_best_score = score
-                cluster_best_bpm = float(bpm)
 
-        coarse_scores.sort(reverse=True)
-        refined_windows: list[tuple[float, float]] = []
-        for _, coarse_bpm in coarse_scores[:3]:
-            refined_windows.append((
-                max(40.0, coarse_bpm - 1.0),
-                min(300.0, coarse_bpm + 1.0),
-            ))
-        for fine_min, fine_max in refined_windows:
-            for bpm in np.arange(fine_min, fine_max + 0.001, 0.05):
-                score = combined_score(float(bpm), support)
-                if score > cluster_best_score:
-                    cluster_best_score = score
-                    cluster_best_bpm = float(bpm)
+# --- DFT tempo estimator (matches dfttempo_awd / meas_key_tempo) -----------
 
-        if cluster_best_bpm > 0:
-            ranked.append((cluster_best_score, cluster_best_bpm, cluster))
 
-    if len(ranked) == 0:
+@functools.lru_cache(maxsize=1)
+def _dft_tables() -> tuple[np.ndarray, np.ndarray]:
+    angles = np.linspace(0, 2 * math.pi, DFT_TABLE_SIZE, endpoint=False)
+    return np.cos(angles), np.sin(angles)
+
+
+def _dft_tempo(
+    onset_envelope: np.ndarray,
+    envelope_sr: float,
+    bpm_min: int = BPM_MIN,
+    bpm_max: int = BPM_MAX,
+) -> float:
+    """Match the decompiled DFT tempo detector: integer BPMs in
+    ``[bpm_min, bpm_max)``, sum of |DFT(bpm)| and 0.5 * |DFT(2*bpm)| for
+    fundamental + first harmonic."""
+    n = len(onset_envelope)
+    if n == 0:
         return 0.0
 
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    best_score, best_bpm, best_cluster = ranked[0]
-    for score, bpm, cluster in ranked[1:]:
-        in_preferred = preferred_min_bpm <= bpm <= preferred_max_bpm
-        best_in_preferred = preferred_min_bpm <= best_bpm <= preferred_max_bpm
-        if best_in_preferred and not in_preferred:
-            continue
-        if in_preferred and not best_in_preferred:
-            best_score = score
-            best_bpm = bpm
-            best_cluster = cluster
-            continue
-        if best_score - score <= 0.01 and bpm < best_bpm:
-            best_score = score
-            best_bpm = bpm
-            best_cluster = cluster
+    cos_table, sin_table = _dft_tables()
+    indices = np.arange(n, dtype=np.float64)
 
-    # Snap ambiguous continuous results back onto a discrete supported tempo in the same family.
-    snap_candidates: list[tuple[float, float]] = []
-    for bpm, weight in best_cluster:
-        if 40.0 <= bpm <= 300.0:
-            snap_candidates.append((float(bpm), float(weight)))
+    best_bpm = 0.0
+    best_energy = 0.0
 
-    if len(snap_candidates) > 0:
-        scored_snaps: list[tuple[float, float]] = []
-        cluster_support = float(sum(weight for _, weight in best_cluster))
-        for bpm, weight in snap_candidates:
-            snap_score = combined_score(bpm, cluster_support) + weight * 0.01
-            scored_snaps.append((snap_score, bpm))
+    for bpm in range(bpm_min, bpm_max):
+        step = DFT_TABLE_SIZE * 2.0 * bpm / (60.0 * envelope_sr)
+        phases = indices * step
 
-        scored_snaps.sort(reverse=True)
-        snap_score, snap_bpm = scored_snaps[0]
-        for candidate_score, candidate_bpm in scored_snaps[1:]:
-            in_preferred = preferred_min_bpm <= candidate_bpm <= preferred_max_bpm
-            snap_in_preferred = preferred_min_bpm <= snap_bpm <= preferred_max_bpm
-            if snap_in_preferred and not in_preferred:
-                continue
-            if in_preferred and not snap_in_preferred:
-                snap_score = candidate_score
-                snap_bpm = candidate_bpm
-                continue
-            if snap_score - candidate_score <= 0.005 and candidate_bpm < snap_bpm:
-                snap_score = candidate_score
-                snap_bpm = candidate_bpm
+        idx_fund = (phases.astype(np.int64) >> 1) & (DFT_TABLE_SIZE - 1)
+        idx_harm = phases.astype(np.int64) & (DFT_TABLE_SIZE - 1)
 
-        if best_score - snap_score <= 0.01:
-            best_bpm = snap_bpm
+        sc_fund = float(np.dot(onset_envelope, cos_table[idx_fund]))
+        ss_fund = float(np.dot(onset_envelope, sin_table[idx_fund]))
+        sc_harm = float(np.dot(onset_envelope, cos_table[idx_harm]))
+        ss_harm = float(np.dot(onset_envelope, sin_table[idx_harm]))
 
-    supported_base_score = base_score(best_bpm)
+        fund = math.hypot(sc_fund, ss_fund)
+        harm = math.hypot(sc_harm, ss_harm)
+        total = fund + 0.5 * harm
 
-    # Conservative global fallback for cases where interval families miss the true tempo.
-    broad_scores: list[tuple[float, float]] = []
-    for bpm in np.arange(preferred_min_bpm, preferred_max_bpm + 0.001, 1.0):
-        broad_scores.append((base_score(float(bpm)), float(bpm)))
-    broad_scores.sort(reverse=True)
-
-    broad_best_score = -np.inf
-    broad_best_bpm = 0.0
-    for _, coarse_bpm in broad_scores[:3]:
-        for bpm in np.arange(max(preferred_min_bpm, coarse_bpm - 1.0), min(preferred_max_bpm, coarse_bpm + 1.0) + 0.001, 0.1):
-            score = base_score(float(bpm))
-            if score > broad_best_score:
-                broad_best_score = score
-                broad_best_bpm = float(bpm)
-
-    if (
-        broad_best_bpm > 0
-        and broad_best_score >= supported_base_score + 0.015
-        and abs(broad_best_bpm - best_bpm) >= 6.0
-    ):
-        return broad_best_bpm
+        if total > best_energy:
+            best_energy = total
+            best_bpm = float(bpm)
 
     return best_bpm
 
 
-def _regularize_beat_times(
-    beat_times: np.ndarray,
-    beat_activation: np.ndarray,
-    bpm: float,
-    total_duration: float,
-    hop_length: int = HOP_LENGTH,
-    sr: int = SAMPLE_RATE,
-) -> np.ndarray:
-    if len(beat_times) == 0 or bpm <= 0 or total_duration <= 0:
-        return beat_times
-
-    interval = 60.0 / bpm
-    if interval <= 0:
-        return beat_times
-
-    activation = np.asarray(beat_activation, dtype=np.float64)
-    activation = np.nan_to_num(activation, copy=False)
-    if len(activation) == 0:
-        return beat_times
-
-    frame_times = np.arange(len(activation), dtype=np.float64) * hop_length / sr
-    if len(frame_times) == 0:
-        return beat_times
-
-    activation = activation - np.percentile(activation, 60)
-    activation[activation < 0] = 0.0
-    if np.max(activation) > 0:
-        activation /= np.max(activation)
-
-    def activation_at(times: np.ndarray) -> np.ndarray:
-        clipped = np.clip(times, 0.0, frame_times[-1])
-        return np.interp(clipped, frame_times, activation)
-
-    phase_candidates = np.linspace(0.0, interval, max(24, int(np.ceil(interval * 80.0))), endpoint=False)
-    best_phase = 0.0
-    best_score = -1.0
-    for phase in phase_candidates:
-        grid = np.arange(phase, total_duration + interval, interval)
-        if len(grid) == 0:
-            continue
-        score = float(np.mean(np.sort(activation_at(grid))[int(len(grid) * 0.2) :]))
-        if score > best_score:
-            best_score = score
-            best_phase = float(phase)
-
-    beat_indices = np.rint((beat_times - best_phase) / interval).astype(np.int64)
-    if len(beat_indices) == 0:
-        return beat_times
-
-    first_index = int(np.min(beat_indices)) - 1
-    last_index = int(np.max(beat_indices)) + 1
-    candidate_indices = np.arange(first_index, last_index + 1, dtype=np.int64)
-
-    tolerance = max(interval * 0.22, hop_length / sr * 1.5)
-    regularized = []
-
-    for idx in candidate_indices:
-        target_time = best_phase + idx * interval
-        if target_time < 0.0 or target_time > total_duration:
-            continue
-
-        distances = np.abs(beat_times - target_time)
-        nearby = np.flatnonzero(distances <= tolerance)
-        if len(nearby) > 0:
-            nearby_times = beat_times[nearby]
-            weights = activation_at(nearby_times)
-            if np.sum(weights) > 0:
-                snapped = float(np.average(nearby_times, weights=weights))
-            else:
-                snapped = float(np.median(nearby_times))
-            regularized.append(snapped)
-        else:
-            regularized.append(float(target_time))
-
-    if len(regularized) == 0:
-        return beat_times
-
-    regularized_times = np.array(regularized, dtype=np.float64)
-    regularized_times = np.unique(np.round(regularized_times, 6))
-    return regularized_times
+# --- Postprocessing --------------------------------------------------------
 
 
-def _extract_interval_bpm_candidates(
-    times: np.ndarray,
-    multiplier: float,
-    min_bpm: float,
-    max_bpm: float,
-    base_weight: float,
-    min_interval_step: float,
-) -> list[tuple[float, float]]:
-    if len(times) < 2:
-        return []
+def _postprocess(
+    beat_peaks: np.ndarray,
+    downbeat_peaks: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Cluster adjacent peaks, convert to seconds, snap downbeats onto the
+    nearest beat, and insert synthetic beats when a downbeat lies further than
+    ``DOWNBEAT_TOLERANCE_FACTOR * mean_interval`` from any existing beat."""
+    beat_frames = _cluster_adjacent_peaks(beat_peaks)
+    downbeat_frames = _cluster_adjacent_peaks(downbeat_peaks)
 
-    intervals = np.diff(times)
-    intervals = intervals[np.isfinite(intervals) & (intervals > 0)]
-    if len(intervals) == 0:
-        return []
+    beat_times = beat_frames / FRAME_RATE
+    downbeat_times = downbeat_frames / FRAME_RATE
 
-    median_interval = float(np.median(intervals))
-    interval_step = max(min_interval_step, median_interval * 0.1)
+    if len(beat_times) == 0 or len(downbeat_times) == 0:
+        return beat_times, downbeat_times
 
-    lo = max(np.min(intervals), 60.0 * multiplier / max_bpm)
-    hi = min(np.max(intervals), 60.0 * multiplier / min_bpm)
-    valid = intervals[(intervals >= lo) & (intervals <= hi)]
-    if len(valid) == 0 or hi <= lo:
-        return []
-
-    bins = np.arange(lo, hi + interval_step, interval_step)
-    if len(bins) < 3:
-        bins = np.array([lo, lo + interval_step, hi + interval_step], dtype=np.float64)
-    hist, edges = np.histogram(valid, bins=bins)
-    if not np.any(hist):
-        return []
-
-    peak_indices = []
-    for idx in range(len(hist)):
-        left = hist[idx - 1] if idx > 0 else -1
-        right = hist[idx + 1] if idx + 1 < len(hist) else -1
-        if hist[idx] > 0 and hist[idx] >= left and hist[idx] >= right:
-            peak_indices.append(idx)
-    if len(peak_indices) == 0:
-        peak_indices = [int(np.argmax(hist))]
-
-    peak_indices = sorted(peak_indices, key=lambda idx: (hist[idx], -idx), reverse=True)[:6]
-    candidates: list[tuple[float, float]] = []
-    for idx in peak_indices:
-        dominant_interval = 0.5 * (edges[idx] + edges[idx + 1])
-        tolerance = max(interval_step, dominant_interval * 0.12)
-        cluster = valid[np.abs(valid - dominant_interval) <= tolerance]
-        if len(cluster) == 0:
-            continue
-
-        dominant_interval = float(np.median(cluster))
-        bpm = 60.0 * multiplier / dominant_interval
-        if not np.isfinite(bpm) or bpm < min_bpm or bpm > max_bpm:
-            continue
-
-        coverage = len(cluster) / len(valid)
-        prominence = hist[idx] / np.max(hist)
-        candidates.append((float(bpm), base_weight * (1.0 + coverage + prominence)))
-
-    return candidates
-
-
-def _calculate_bpm(
-    beat_times: np.ndarray,
-    downbeat_times: Optional[np.ndarray] = None,
-    beat_activation: Optional[np.ndarray] = None,
-    hop_length: int = HOP_LENGTH,
-    sr: int = SAMPLE_RATE,
-    min_bpm: float = 40.0,
-    max_bpm: float = 300.0,
-    beats_per_bar: int = 4,
-    activation_context: Optional[tuple[np.ndarray, np.ndarray]] = None,
-    activation_score_cache: Optional[dict[tuple[float, float], float]] = None,
-) -> float:
-    candidates: list[tuple[float, float]] = []
-
-    min_interval_step = hop_length / sr
-    candidates.extend(
-        _extract_interval_bpm_candidates(
-            beat_times,
-            multiplier=1.0,
-            min_bpm=min_bpm,
-            max_bpm=max_bpm,
-            base_weight=1.0,
-            min_interval_step=min_interval_step,
-        )
+    snapped_db = np.array(
+        [float(beat_times[np.argmin(np.abs(beat_times - db))]) for db in downbeat_times],
+        dtype=np.float64,
     )
-    if downbeat_times is not None and beats_per_bar > 0:
-        candidates.extend(
-            _extract_interval_bpm_candidates(
-                downbeat_times,
-                multiplier=float(beats_per_bar),
-                min_bpm=min_bpm,
-                max_bpm=max_bpm,
-                base_weight=1.5,
-                min_interval_step=min_interval_step,
-            )
+    snapped_db = np.sort(snapped_db)
+    snapped_db = np.array(
+        [
+            v for i, v in enumerate(snapped_db)
+            if i == 0 or snapped_db[i] != snapped_db[i - 1]
+        ],
+        dtype=np.float64,
     )
-    if beat_activation is not None:
-        if activation_context is None:
-            activation_context = _prepare_activation_context(beat_activation)
-        supported_bpm = _select_supported_bpm(
-            candidates,
-            beat_times=beat_times,
-            beat_activation=beat_activation,
-            hop_length=hop_length,
-            sr=sr,
-            activation_context=activation_context,
-            activation_score_cache=activation_score_cache,
-        )
-        if supported_bpm > 0:
-            return supported_bpm
 
-    if len(candidates) == 0:
-        return 0.0
+    if len(beat_times) >= 2:
+        mean_interval = float(np.mean(np.diff(beat_times)))
+        tolerance = mean_interval * DOWNBEAT_TOLERANCE_FACTOR
+    else:
+        tolerance = 0.1
 
-    bpms = np.array([bpm for bpm, _ in candidates], dtype=np.float64)
-    weights = np.array([weight for _, weight in candidates], dtype=np.float64)
+    for db in snapped_db:
+        distances = np.abs(beat_times - db)
+        nearest_dist = float(distances[np.argmin(distances)])
 
-    # Collapse octave-equivalent estimates, then keep the strongest supported tempo.
-    for i, bpm in enumerate(bpms):
-        aliases = [bpm]
-        if bpm * 2.0 <= max_bpm:
-            aliases.append(bpm * 2.0)
-        if bpm / 2.0 >= min_bpm:
-            aliases.append(bpm / 2.0)
+        if nearest_dist > tolerance:
+            insert_pos = int(np.searchsorted(beat_times, db))
+            beat_times = np.insert(beat_times, insert_pos, db)
 
-        best_alias = min(aliases, key=lambda alias: np.average(np.abs(bpms - alias), weights=weights))
-        bpms[i] = best_alias
+    return beat_times, snapped_db
 
-    bins = np.arange(min_bpm, max_bpm + 1.0, 1.0)
-    hist, edges = np.histogram(bpms, bins=bins, weights=weights)
-    peak_idx = int(np.argmax(hist))
-    dominant_bpm = 0.5 * (edges[peak_idx] + edges[peak_idx + 1])
-    cluster = np.abs(bpms - dominant_bpm) <= max(1.5, dominant_bpm * 0.03)
-    if np.any(cluster):
-        dominant_bpm = float(np.average(bpms[cluster], weights=weights[cluster]))
 
-    return float(dominant_bpm)
+# --- Top-level entry point -------------------------------------------------
 
 
 def analyze_bpm(
     audio_path: str,
     session: Optional[ort.InferenceSession] = None,
-    chunk_duration: float = CHUNK_DURATION,
-    overlap_duration: float = OVERLAP_DURATION,
 ) -> dict:
     if session is None:
         session = load_model_from_memory()
 
     info = sf.info(audio_path)
     file_sr = info.samplerate
-    total_frames = info.frames
 
-    chunk_file_samples = int(chunk_duration * file_sr)
-    overlap_file_samples = int(overlap_duration * file_sr)
-    step_file_samples = chunk_file_samples - overlap_file_samples
-    if step_file_samples <= 0:
-        step_file_samples = chunk_file_samples
+    audio, _ = sf.read(audio_path)
+    if audio.ndim > 1:
+        audio = np.mean(audio, axis=1)
 
-    all_beat = []
-    all_downbeat = []
+    if file_sr != SAMPLE_RATE:
+        audio = librosa.resample(audio, orig_sr=file_sr, target_sr=SAMPLE_RATE)
 
-    with sf.SoundFile(audio_path) as f:
-        offset = 0
-        while offset < total_frames:
-            f.seek(offset)
-            chunk = f.read(chunk_file_samples)
+    audio = audio.astype(np.float32)
 
-            if chunk.ndim > 1:
-                chunk = np.mean(chunk, axis=1)
+    # 1. Mel spectrogram at the reference 50 fps frame rate.
+    mel_data = _compute_mel(audio)
 
-            if file_sr != SAMPLE_RATE:
-                chunk = librosa.resample(chunk, orig_sr=file_sr, target_sr=SAMPLE_RATE)
+    # 2. Onset envelope = max(diff(mel), 0) summed over the mel axis; this is
+    #    what the decompiled tempo estimate consumes.
+    onset_env = np.sum(np.maximum(np.diff(mel_data, axis=0), 0.0), axis=1)
+    bpm = _dft_tempo(onset_env, FRAME_RATE)
 
-            mel_input = _compute_mel(chunk, SAMPLE_RATE)
-            mel_input = mel_input[np.newaxis, ...]
+    # 3. Sliding ONNX inference over the mel spectrogram, overlap-merged.
+    total_mel_frames = mel_data.shape[0]
 
-            outputs = session.run(None, {"mel": mel_input})
-            beat_act = np.asarray(outputs[0][0], dtype=np.float64)
-            downbeat_act = np.asarray(outputs[1][0], dtype=np.float64)
+    chunk_starts: list[int] = []
+    n = -CHUNK_CONTEXT
+    while n < total_mel_frames - CHUNK_CONTEXT:
+        chunk_starts.append(n)
+        n += CHUNK_FRAME_STRIDE
 
-            if offset > 0:
-                overlap_frames = int(overlap_duration * SAMPLE_RATE / HOP_LENGTH)
-                if overlap_frames < len(beat_act):
-                    beat_act = beat_act[overlap_frames:]
-                    downbeat_act = downbeat_act[overlap_frames:]
+    beat_activation = np.zeros(total_mel_frames, dtype=np.float32)
+    downbeat_activation = np.zeros(total_mel_frames, dtype=np.float32)
+    overlap_count = np.zeros(total_mel_frames, dtype=np.float32)
 
-            all_beat.append(beat_act)
-            all_downbeat.append(downbeat_act)
+    for chunk_start in chunk_starts:
+        mel_start = chunk_start + CHUNK_CONTEXT
+        mel_end = mel_start + ONNX_CHUNK_LEN
 
-            offset += step_file_samples
+        actual_start = max(mel_start, 0)
+        actual_end = min(mel_end, total_mel_frames)
+        available = actual_end - actual_start
 
-    beat_activation = np.concatenate(all_beat)
-    downbeat_activation = np.concatenate(all_downbeat)
-    total_duration = len(beat_activation) * HOP_LENGTH / SAMPLE_RATE
-    activation_context = _prepare_activation_context(beat_activation)
-    activation_score_cache: dict[tuple[float, float], float] = {}
+        if available <= 0:
+            continue
 
-    beat_times = _detect_peaks(beat_activation, HOP_LENGTH, SAMPLE_RATE)
-    downbeat_times = _detect_peaks(
-        downbeat_activation,
-        HOP_LENGTH,
-        SAMPLE_RATE,
-        max_bpm=300.0 / BEATS_PER_BAR,
-    )
+        chunk_mel = np.zeros((ONNX_CHUNK_LEN, N_MELS), dtype=np.float32)
+        offset_in_chunk = actual_start - mel_start
+        chunk_mel[offset_in_chunk:offset_in_chunk + available] = mel_data[actual_start:actual_end]
 
-    bpm = _calculate_bpm(
-        beat_times,
-        beat_activation=beat_activation,
-        hop_length=HOP_LENGTH,
-        sr=SAMPLE_RATE,
-        beats_per_bar=BEATS_PER_BAR,
-        activation_context=activation_context,
-        activation_score_cache=activation_score_cache,
-    )
-    regularized_beat_times = _regularize_beat_times(
-        beat_times,
-        beat_activation=beat_activation,
-        bpm=bpm,
-        total_duration=total_duration,
-        hop_length=HOP_LENGTH,
-        sr=SAMPLE_RATE,
-    )
-    regularized_bpm = _calculate_bpm(
-        regularized_beat_times,
-        beat_activation=beat_activation,
-        hop_length=HOP_LENGTH,
-        sr=SAMPLE_RATE,
-        beats_per_bar=BEATS_PER_BAR,
-        activation_context=activation_context,
-        activation_score_cache=activation_score_cache,
-    )
+        mel_input = chunk_mel[np.newaxis, :, :]
 
-    raw_score = _score_bpm_on_activation(
-        beat_activation,
-        bpm,
-        hop_length=HOP_LENGTH,
-        sr=SAMPLE_RATE,
-        context=activation_context,
-        score_cache=activation_score_cache,
-    )
-    regularized_score = _score_bpm_on_activation(
-        beat_activation,
-        regularized_bpm,
-        hop_length=HOP_LENGTH,
-        sr=SAMPLE_RATE,
-        context=activation_context,
-        score_cache=activation_score_cache,
-    )
+        outputs = session.run(None, {"mel": mel_input})
+        beat_act = np.asarray(outputs[0][0], dtype=np.float32)
+        downbeat_act = np.asarray(outputs[1][0], dtype=np.float32)
 
-    beat_count_ratio = (
-        len(regularized_beat_times) / len(beat_times)
-        if len(beat_times) > 0
-        else 1.0
-    )
-    score_gain = regularized_score - raw_score
-    bpm_drift = abs(regularized_bpm - bpm)
-    should_use_regularized = (
-        len(regularized_beat_times) > 0
-        and 0.8 <= beat_count_ratio <= 1.35
-        and (
-            score_gain >= 0.01
-            or (score_gain >= 0.003 and bpm_drift <= max(2.0, bpm * 0.03))
-        )
-    )
+        write_start = mel_start
+        if write_start < 0:
+            skip = -write_start
+            beat_act = beat_act[skip:]
+            downbeat_act = downbeat_act[skip:]
+            write_start = 0
 
-    if should_use_regularized:
-        beat_times = regularized_beat_times
-        bpm = regularized_bpm
+        write_end = min(mel_end, total_mel_frames)
+        write_len = write_end - write_start
+
+        if write_len <= 0 or write_len > len(beat_act):
+            continue
+
+        beat_activation[write_start:write_start + write_len] += beat_act[:write_len]
+        downbeat_activation[write_start:write_start + write_len] += downbeat_act[:write_len]
+        overlap_count[write_start:write_start + write_len] += 1.0
+
+    has_overlap = overlap_count > 0
+    beat_activation[has_overlap] /= overlap_count[has_overlap]
+    downbeat_activation[has_overlap] /= overlap_count[has_overlap]
+
+    # 4. Peak detection, clustering, and downbeat snapping.
+    beat_peaks = _detect_peaks(beat_activation)
+    downbeat_peaks = _detect_peaks(downbeat_activation)
+
+    beat_times, downbeat_times = _postprocess(beat_peaks, downbeat_peaks)
 
     return {
-        "bpm": round(bpm, 2),
+        "bpm": bpm,
         "beat_times": beat_times.tolist(),
         "downbeat_times": downbeat_times.tolist(),
     }
@@ -849,8 +369,6 @@ app = typer.Typer()
 @app.command()
 def analyze(
     audio_path: pathlib.Path = typer.Argument(..., help="音频文件路径", exists=True, dir_okay=False),
-    chunk_duration: float = typer.Option(CHUNK_DURATION, "--chunk-duration", "-c", help="分块时长（秒）"),
-    overlap_duration: float = typer.Option(OVERLAP_DURATION, "--overlap-duration", "-o", help="分块重叠时长（秒）"),
     model_path: Optional[pathlib.Path] = typer.Option(None, "--model-path", "-m", help="加密模型文件路径"),
     json_output: bool = typer.Option(False, "--json", "-j", help="以 JSON 格式输出结果"),
 ) -> None:
@@ -859,8 +377,6 @@ def analyze(
     result = analyze_bpm(
         str(audio_path),
         session=session,
-        chunk_duration=chunk_duration,
-        overlap_duration=overlap_duration,
     )
 
     if json_output:
