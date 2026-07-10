@@ -163,7 +163,7 @@ class MLG2PProvider:
         # take up to (MAX-1) chars from the word, then append the end marker.
         seq = word[: MAX_WORD_LENGTH - 1] + END_GRAPHEME
         ids: list[int] = []
-        # Decompiled fallback id for missing keys is 2 (the value past the EOF
+        # Fallback id for missing keys is 2 (the value past the EOF
         # marker in the QHash default), which corresponds to 'a' here.
         unk_id = 2
         for ch in seq:

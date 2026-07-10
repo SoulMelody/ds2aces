@@ -34,7 +34,7 @@ PAD_SIZE = 512               # reflect-pad samples before STFT
 MAG_SCALE = 0.03125          # 1/32: |STFT| * MAG_SCALE -> mel filterbank
 LOG_SCALE = 1000.0           # log1p(x * LOG_SCALE)
 
-# Sliding-window ONNX inference. Matches the decompiled chunk loop:
+# Sliding-window ONNX inference. Matches chunk loop:
 #   chunk_start in [-CHUNK_CONTEXT .. n-CHUNK_CONTEXT), stride = CHUNK_FRAME_STRIDE
 #   mel window fed to the model = ONNX_CHUNK_LEN frames starting at
 #   chunk_start + CHUNK_CONTEXT.
@@ -94,7 +94,7 @@ def load_model_from_memory(encrypted_path: str = MODEL_PATH) -> ort.InferenceSes
 
 
 def _compute_mel(audio: np.ndarray) -> np.ndarray:
-    """Match the decompiled mel pipeline:
+    """Match the mel pipeline:
 
         reflect-pad by PAD_SIZE -> |STFT(center=False)| * MAG_SCALE ->
         mel @ mag -> log1p(x * LOG_SCALE) -> drop PAD_SIZE//HOP_LENGTH frames.
@@ -119,7 +119,7 @@ def _compute_mel(audio: np.ndarray) -> np.ndarray:
     return compressed.T[start_frame:]
 
 
-# --- Peak detection (matches the decompiled running-max path) --------------
+# --- Peak detection (matches the running-max path) --------------
 
 
 def _running_max(activation: np.ndarray, radius: int = PEAK_RUNNING_MAX_RADIUS) -> np.ndarray:
@@ -180,7 +180,7 @@ def _dft_tempo(
     bpm_min: int = BPM_MIN,
     bpm_max: int = BPM_MAX,
 ) -> float:
-    """Match the decompiled DFT tempo detector: integer BPMs in
+    """Match the DFT tempo detector: integer BPMs in
     ``[bpm_min, bpm_max)``, sum of |DFT(bpm)| and 0.5 * |DFT(2*bpm)| for
     fundamental + first harmonic."""
     n = len(onset_envelope)
@@ -291,7 +291,7 @@ def analyze_bpm(
     mel_data = _compute_mel(audio)
 
     # 2. Onset envelope = max(diff(mel), 0) summed over the mel axis; this is
-    #    what the decompiled tempo estimate consumes.
+    #    what the tempo estimate consumes.
     onset_env = np.sum(np.maximum(np.diff(mel_data, axis=0), 0.0), axis=1)
     bpm = _dft_tempo(onset_env, FRAME_RATE)
 

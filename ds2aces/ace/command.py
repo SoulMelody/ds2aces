@@ -17,13 +17,16 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from email.parser import BytesParser
+from email.policy import default
 from urllib.parse import urljoin
-from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypeAlias
+from typing import Any, BinaryIO, Literal, TypeAlias
 
 import asyncio_oss
 import anyio
 import httpx2
 import more_itertools
+import numpy as np
 import oss2
 import pypinyin
 import soundfile as sf
@@ -61,10 +64,9 @@ from ds2aces.ace.model import (
 from ds2aces.ace.latin_g2p import MLG2PService
 from ds2aces.ds.ds_file import DsProject
 from ds2aces.ds.phoneme_dict import get_ds_phone_dict, get_vowels_set
+from ds2aces.local.pipeline import Pipeline
+from ds2aces.local.utils import provider_names, resolve_mlaudio_dir
 from ds2aces.utils.music_math import hz2midi, note2midi
-
-if TYPE_CHECKING:
-    import numpy as np
 
 with contextlib.suppress(ImportError, OSError):
     from timsdk.manager import TIMManager
@@ -267,7 +269,6 @@ def cut_aces(aces: AcesItem) -> list[AcesItem]:
         return indices
 
     def best_cut(list_to_cut: list[AcesNoteItem], indices: list[int], target: float) -> int:
-        # ACE Studio's score (decompile/140954F70.c:190,288,565,656):
         # score = (target - left_len) * gap_size, maximised. Equivalent to
         # preferring large gaps that sit near the middle of the segment.
         list_start = float(list_to_cut[0]["start_time"])
@@ -281,7 +282,7 @@ def cut_aces(aces: AcesItem) -> list[AcesItem]:
     def simple_cut(list_to_cut: list[AcesNoteItem]) -> list[list[AcesNoteItem]]:
         target = (float(list_to_cut[-1]["end_time"]) - float(list_to_cut[0]["start_time"])) / 2
 
-        # Multi-pass fallback (mirrors decompile/140954F70.c passes):
+        # Multi-pass fallback:
         for min_gap in (PIECE_SPLIT_GAP_PASS1, PIECE_SPLIT_GAP_PASS2, 0.0):
             indices = candidate_cut_indices(list_to_cut, min_gap)
             if indices:
@@ -526,6 +527,187 @@ async def one_piece_compose(client: httpx2.AsyncClient, ace_token: str, aces: di
     pst = result.get('pst')
 
     return pst, audio_data, samplerate
+
+
+_ACE_ENGINE_BODY_V2_FIELD_ORDER = (
+    "ace_token",
+    "session_id",
+    "context_id",
+    "mix_info",
+    "inpainting_time_list",
+    "delete_time_list",
+    "response_type",
+    "version",
+)
+
+
+def _ordered_engine_body_v2_data(compose_body: AceEngineBodyV2) -> dict:
+    data = compose_body.model_dump(mode="json")
+    return {field: data[field] for field in _ACE_ENGINE_BODY_V2_FIELD_ORDER if field in data}
+
+
+def _encode_file_first_multipart_data(
+    *,
+    data: dict,
+    files: dict,
+    boundary: bytes,
+) -> tuple[dict[str, str], object]:
+    from httpx2 import ByteStream
+    from httpx2._multipart import DataField, FileField
+
+    mp_fields = [FileField(name=name, value=value) for name, value in files.items()]
+    for name, value in data.items():
+        if isinstance(value, (tuple, list)):
+            mp_fields.extend(DataField(name=name, value=item) for item in value)
+        else:
+            mp_fields.append(DataField(name=name, value=value))
+
+    chunks: list[bytes] = []
+    for mp_field in mp_fields:
+        chunks.append(b"--%s\r\n" % boundary)
+        chunks.extend(mp_field.render())
+        chunks.append(b"\r\n")
+    chunks.append(b"--%s--\r\n" % boundary)
+    body = b"".join(chunks)
+    headers = {
+        "Content-Length": str(len(body)),
+        "Content-Type": f"multipart/form-data; boundary={boundary.decode('ascii')}",
+    }
+    return headers, ByteStream(body)
+
+
+def _inpainting_time_list_for_notes_local(aces: dict) -> str:
+    """Variant for response_type=1: uses actual note start/end span."""
+    notes = [
+        note for note in aces.get("notes", [])
+        if note.get("type") not in {"br", "sp"} and "start_time" in note and "end_time" in note
+    ]
+    if not notes:
+        return "[]"
+    start_time = min(float(note["start_time"]) for note in notes)
+    end_time = max(float(note["end_time"]) for note in notes)
+    return json.dumps([{"end_time": end_time, "start_time": start_time}], separators=(",", ":"))
+
+
+async def one_piece_compose_tokens(
+    client: httpx2.AsyncClient,
+    ace_token: str,
+    aces: dict,
+    router_url: str,
+    router_version: int,
+) -> tuple[float, np.ndarray]:
+    """合成单个片段，使用 response_type=1 获取中间表示（tokens）用于本地合成。
+
+    Returns:
+        (pst, tokens) where tokens is [N, 32] uint16.
+    """
+    user_config = read_ace_user_info_config()
+    user_id = json.loads(
+        json.loads(user_config.get("user_info_group", "user_info_key"))
+    )["uid"]
+    timestamp = int(time.time() * 1000)
+    upload_path = f"{user_id}_{timestamp}.aces"
+
+    if router_version == 1:
+        compose_body = AceEngineBody(
+            compress_type="zstd",
+            flag=".aces",
+            ace_token=ace_token,
+            pipeline_business=2,
+        )
+    else:
+        compose_body = AceEngineBodyV2(
+            ace_token=ace_token,
+            session_id=f"{user_id}_{timestamp}",
+            context_id="1",
+            response_type="1",
+            mix_info=aces.get("mix_info", ""),
+            inpainting_time_list=_inpainting_time_list_for_notes_local(aces),
+        )
+
+    # Strip None fields to match real ACE Studio .aces format
+    aces = {k: v for k, v in aces.items() if v is not None}
+    for note in aces.get("notes", []):
+        for k in [k for k, v in note.items() if v is None]:
+            del note[k]
+
+    files = {
+        "file": (
+            upload_path,
+            io.BytesIO(compress_ace_segment(json.dumps(aces), raw=router_version >= 2)),
+            "application/octet-stream",
+        )
+    }
+
+    form_boundary = f"----WebKitFormBoundary{time.time()}"
+    request_data = (
+        _ordered_engine_body_v2_data(compose_body)
+        if isinstance(compose_body, AceEngineBodyV2)
+        else compose_body.model_dump(mode="json")
+    )
+
+    request = client.build_request("POST", router_url)
+    encode_multipart = (
+        _encode_file_first_multipart_data
+        if isinstance(compose_body, AceEngineBodyV2)
+        else encode_multipart_data
+    )
+    headers, stream = encode_multipart(data=request_data, files=files, boundary=form_boundary.encode())
+    request.stream = stream
+    request.headers.update(headers)
+    compose_resp = await client.send(request)
+
+    # Parse multipart response — tokens are in a named part
+    response_bytes = getattr(compose_resp, "content", b"") or b""
+    response_headers = getattr(compose_resp, "headers", {}) or {}
+    response_ct = response_headers.get("content-type", "") if hasattr(response_headers, "get") else ""
+
+    if "multipart/form-data" not in response_ct.lower() or not response_bytes:
+        msg = f"ACE Studio compose(response_type=1) returned non-multipart response for {router_url}"
+        raise RuntimeError(msg)
+
+    message = BytesParser(policy=default).parsebytes(
+        f"Content-Type: {response_ct}\r\nMIME-Version: 1.0\r\n\r\n".encode() + response_bytes
+    )
+
+    pst: float = 0.0
+    tokens_file_bytes: bytes | None = None
+    error_msg: str | None = None
+
+    for part in message.iter_parts():
+        raw_payload = part.get_payload(decode=True)
+        payload = raw_payload if isinstance(raw_payload, bytes) else b""
+        name = part.get_param("name", header="content-disposition")
+
+        if name == "data" and payload:
+            with contextlib.suppress(json.JSONDecodeError, UnicodeDecodeError):
+                data_obj = json.loads(payload.decode("utf-8"))
+                if isinstance(data_obj, dict):
+                    pst = float(data_obj.get("pst") or data_obj.get("offset") or 0.0)
+        elif name == "tokens" and payload:
+            tokens_file_bytes = payload
+        elif name == "error" and payload:
+            error_msg = payload.decode("utf-8").strip()
+
+    if error_msg:
+        raise RuntimeError(f"ACE Studio compose(response_type=1) error: {error_msg}")
+    if tokens_file_bytes is None:
+        raise RuntimeError(
+            f"No tokens.npz in compose(response_type=1) response from {router_url}"
+        )
+
+    # Load .npz archive
+    npz = np.load(io.BytesIO(tokens_file_bytes))
+    tokens: np.ndarray | None = None
+    for key in npz.files:
+        arr = npz[key]
+        if arr.ndim == 2 and arr.shape[1] == 32:
+            tokens = arr
+            break
+    if tokens is None:
+        tokens = npz[npz.files[0]]
+
+    return pst, tokens
 
 async def rendering_ace_list(client: httpx2.AsyncClient, ace_list: list[AcesItem], save_to_path: pathlib.Path, as_token: str, router_id: int) -> None:
     vocal_offset = None
@@ -826,6 +1008,9 @@ async def ds_to_aces(
     param: bool = False,
     render: bool = False,
     language: Literal["ch", "en", "jp", "spa", "ko", "pt", "fr", "it"] = "ch",
+    local: bool = False,
+    mlaudio_dir: pathlib.Path | None = None,
+    provider: Literal["cpu", "cuda", "dml", "coreml"] = "cpu",
 ) -> None:
     client = await pre_login()
     if not client:
@@ -850,7 +1035,7 @@ async def ds_to_aces(
     notes = []
     await fetch_singers(client)
     seed_id = typer.prompt("Please input the seed id", default=DEFAULT_SEED)
-    if render:
+    if render or local:
         mix_info_resp = await client.post(
             urljoin(
                 ACE_API_BASE_URL,
@@ -1032,6 +1217,72 @@ async def ds_to_aces(
     logger.info(f"Successfully saved to '{aces_file.absolute()}'")
     if render:
         await render_aces(client, aces_file, router_id)
+    if local:
+        await render_aces_local(client, aces_file, router_id, output_dir, mlaudio_dir, provider)
+
+async def render_aces_local(
+    client: httpx2.AsyncClient,
+    aces_file: pathlib.Path,
+    router_id: int,
+    output_dir: pathlib.Path,
+    mlaudio_dir: pathlib.Path | None = None,
+    provider: Literal["cpu", "cuda", "dml", "coreml"] = "cpu",
+) -> None:
+    """Render ACES using cloud tokens + local inference pipeline."""
+    as_token = await fetch_as_token(client)
+    if not as_token:
+        raise ValueError("fetch as token failed")
+
+    long_aces = json.loads(aces_file.read_text(encoding="utf-8"))
+    long_aces = filter_short_note(long_aces)
+    cutted_aces = cut_aces(long_aces)
+
+    code2router_url = await fetch_router_config(client)
+    if not code2router_url:
+        return
+    router_url, router_version = code2router_url[router_id]
+
+    # Initialize the local inference pipeline
+    resolved_mlaudio_dir = resolve_mlaudio_dir(mlaudio_dir)
+    pipeline = Pipeline(resolved_mlaudio_dir, provider_names(provider))
+    logger.info(f"Local pipeline initialized (mlaudio: {resolved_mlaudio_dir}, provider: {provider})")
+
+    vocal_offset: float | None = None
+    concat_audio: list[float] = []
+
+    for aces in track(cutted_aces, description="Rendering ACE tokens locally..."):
+        # Step 1: Get tokens from cloud API (response_type=1)
+        pst, tokens = await one_piece_compose_tokens(
+            client, as_token, aces, router_url, router_version,
+        )
+        logger.info(f"Got tokens: shape={tokens.shape}, pst={pst}")
+
+        # Step 2: Run local inference pipeline
+        result = pipeline.run_from_tokens(tokens)
+        audio_data = result["audio"]
+
+        if vocal_offset is None:
+            vocal_offset = pst
+        else:
+            start_index = int((pst - vocal_offset) * 44100)
+            if len(concat_audio) < start_index:
+                concat_audio.extend([0.0] * (start_index - len(concat_audio)))
+            else:
+                concat_audio = concat_audio[:start_index]
+        concat_audio.extend(audio_data.tolist())
+
+    save_to_path = output_dir / f"{aces_file.stem}.wav"
+    sf.write(save_to_path, concat_audio, 44100)
+    logger.info(f"Local synthesis saved to {save_to_path}")
+    logger.info(f"In relation to the project, the vocal offset is: {vocal_offset}")
+
+    explanation = (
+        "for example:  \n"
+        "   If the accompaniment starts at 1.2 seconds relative to the project \n"
+        "   The vocal starts at 2 seconds relative to the project \n"
+        "   The vocal actually starts 0.5 seconds after the accompaniment."
+    )
+    logger.info(explanation)
 
 @app.command()
 def ds2aces(
@@ -1042,12 +1293,36 @@ def ds2aces(
     param: bool = typer.Option(True),
     render: bool = typer.Option(False),
     language: Literal["ch", "en", "jp", "spa", "ko", "pt", "fr", "it"] = "ch",
+    local: bool = typer.Option(False, "--local", help="Use cloud tokens + local inference pipeline"),
+    mlaudio_dir: pathlib.Path | None = typer.Option(
+        None,
+        "--mlaudio-dir",
+        help="ACE Studio mlaudio directory for --local; auto-detected when omitted",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+    ),
+    provider: Literal["cpu", "cuda", "dml", "coreml"] = typer.Option(
+        "cpu",
+        "--provider",
+        help="ONNX Runtime provider for --local",
+    ),
 ) -> None:
     if language not in ["ch", "en", "jp", "spa", "pt", "fr", "it"]: # TODO: support Korean
         raise NotImplementedError(
             "Only Chinese, Japanese, English, Spanish, Portuguese, French and Italian are supported"
         )
-    anyio.run(ds_to_aces, in_path, output_dir, param, render, language)
+    anyio.run(
+        ds_to_aces,
+        in_path,
+        output_dir,
+        param,
+        render,
+        language,
+        local,
+        mlaudio_dir,
+        provider,
+    )
 
 
 async def transcribe_asynchronous(
